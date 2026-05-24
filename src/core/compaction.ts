@@ -30,7 +30,7 @@ export async function maybeCompactMessages(config: AgentConfig, messages: Messag
           {
             role: "system",
             content:
-              "Summarize this coding-agent conversation for future context. Include user goal, files read, files changed, commands run, blockers, and next step. Be concise."
+              "Summarize this coding-agent conversation for future context. Use these headings exactly: Current goal, Completed work, Key files, Pending work, User constraints. Be concise and preserve facts only."
           },
           { role: "user", content: deterministic }
         ]
@@ -56,24 +56,39 @@ export async function maybeCompactMessages(config: AgentConfig, messages: Messag
 
 function deterministicSummary(messages: Message[], existingSummary: string): string {
   const userGoals = messages.filter((message) => message.role === "user").map((message) => clip(message.content, 500));
-  const toolOutputs = messages
+  const toolActivity = messages
     .filter((message) => message.role === "tool")
     .map((message) => {
       try {
-        const parsed = JSON.parse(message.content) as { tool?: string; output?: string };
-        return `${parsed.tool ?? "tool"}: ${clip(parsed.output ?? "", 500)}`;
+        const parsed = JSON.parse(message.content) as { tool?: string; ok?: boolean; output?: string };
+        return `${parsed.tool ?? "tool"} ${parsed.ok === false ? "failed" : "completed"}: ${clip(parsed.output ?? "", 500)}`;
       } catch {
         return clip(message.content, 500);
       }
     });
+  const keyFiles = extractKeyFiles(toolActivity.join("\n"));
   return [
-    existingSummary ? `Previous summary:\n${existingSummary}` : "",
-    userGoals.length ? `User goals:\n${userGoals.join("\n")}` : "",
-    toolOutputs.length ? `Tool activity:\n${toolOutputs.join("\n")}` : "",
-    "Next step: continue from the latest visible messages."
+    "Current goal:",
+    userGoals.at(-1) ?? "Continue the user's latest coding request.",
+    "",
+    "Completed work:",
+    [existingSummary ? `Prior summary exists. ${clip(existingSummary, 800)}` : "", ...toolActivity].filter(Boolean).join("\n") || "No completed tool work has been summarized yet.",
+    "",
+    "Key files:",
+    keyFiles.length ? keyFiles.join("\n") : "No specific files identified yet.",
+    "",
+    "Pending work:",
+    "Continue from the latest visible messages and verify changes when practical.",
+    "",
+    "User constraints:",
+    "Preserve unrelated user changes; use workspace facts and tool results only."
   ]
-    .filter(Boolean)
     .join("\n\n");
+}
+
+function extractKeyFiles(value: string): string[] {
+  const matches = value.match(/(?:[\w.-]+\/)+[\w.-]+|[\w.-]+\.(?:ts|tsx|js|jsx|json|md|toml|yaml|yml|css|html|py|go|rs)/g) ?? [];
+  return Array.from(new Set(matches)).slice(0, 12);
 }
 
 function clip(value: string, max: number): string {

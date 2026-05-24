@@ -1,4 +1,4 @@
-import type { LlmProvider, Message } from "../core/types.js";
+import type { LlmProvider, Message, ModelResponse } from "../core/types.js";
 
 export interface ChatOptions {
   provider: LlmProvider;
@@ -30,13 +30,18 @@ interface AnthropicResponse {
   };
 }
 
-export async function chat(options: ChatOptions): Promise<string> {
-  if (options.provider === "anthropic") return anthropicChat(options);
-  return openAIChat(options);
+export async function complete(options: ChatOptions): Promise<ModelResponse> {
+  if (options.provider === "anthropic") return anthropicComplete(options);
+  return openAIComplete(options);
 }
 
-async function openAIChat(options: ChatOptions): Promise<string> {
+export async function chat(options: ChatOptions): Promise<string> {
+  return (await complete(options)).content;
+}
+
+async function openAIComplete(options: ChatOptions): Promise<ModelResponse> {
   const endpoint = `${options.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const messages = toProviderMessages(options.messages);
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -45,7 +50,7 @@ async function openAIChat(options: ChatOptions): Promise<string> {
     },
     body: JSON.stringify({
       model: options.model,
-      messages: options.messages,
+      messages,
       temperature: options.temperature ?? 0.2
     })
   });
@@ -57,10 +62,16 @@ async function openAIChat(options: ChatOptions): Promise<string> {
 
   const content = body.choices?.[0]?.message?.content;
   if (!content) throw new Error("OpenAI response did not include message content.");
-  return content;
+  return {
+    provider: options.provider,
+    model: options.model,
+    raw: content,
+    content,
+    streamEvents: []
+  };
 }
 
-async function anthropicChat(options: ChatOptions): Promise<string> {
+async function anthropicComplete(options: ChatOptions): Promise<ModelResponse> {
   const endpoint = `${options.baseUrl.replace(/\/$/, "")}/messages`;
   const { system, messages } = toAnthropicMessages(options.messages);
   const response = await fetch(endpoint, {
@@ -86,20 +97,37 @@ async function anthropicChat(options: ChatOptions): Promise<string> {
 
   const content = body.content?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("");
   if (!content) throw new Error("Anthropic response did not include text content.");
-  return content;
+  return {
+    provider: options.provider,
+    model: options.model,
+    raw: content,
+    content,
+    streamEvents: []
+  };
+}
+
+export function toProviderMessages(messages: Message[]): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const converted: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+  for (const message of messages) {
+    if (message.role === "tool") {
+      const rendered = renderToolMessage(message.content);
+      pushMerged(converted, "user", rendered);
+      continue;
+    }
+    pushMerged(converted, message.role, message.content);
+  }
+  return converted;
 }
 
 function toAnthropicMessages(messages: Message[]): { system: string; messages: Array<{ role: "user" | "assistant"; content: string }> } {
   const systemParts: string[] = [];
   const converted: Array<{ role: "user" | "assistant"; content: string }> = [];
 
-  for (const message of messages) {
+  for (const message of toProviderMessages(messages)) {
     if (message.role === "system") {
       systemParts.push(message.content);
     } else if (message.role === "assistant") {
       pushMerged(converted, "assistant", message.content);
-    } else if (message.role === "tool") {
-      pushMerged(converted, "user", `Tool result:\n${message.content}`);
     } else {
       pushMerged(converted, "user", message.content);
     }
@@ -108,11 +136,21 @@ function toAnthropicMessages(messages: Message[]): { system: string; messages: A
   return { system: systemParts.join("\n\n"), messages: converted };
 }
 
-function pushMerged(messages: Array<{ role: "user" | "assistant"; content: string }>, role: "user" | "assistant", content: string): void {
+function pushMerged<RoleName extends string>(messages: Array<{ role: RoleName; content: string }>, role: RoleName, content: string): void {
   const last = messages[messages.length - 1];
   if (last?.role === role) {
     last.content = `${last.content}\n\n${content}`;
   } else {
     messages.push({ role, content });
+  }
+}
+
+function renderToolMessage(content: string): string {
+  try {
+    const parsed = JSON.parse(content) as { tool?: unknown; ok?: unknown; output?: unknown; errorType?: unknown; metadata?: unknown };
+    const tool = typeof parsed.tool === "string" && parsed.tool ? parsed.tool : "unknown_tool";
+    return `Tool result for ${tool}:\n${JSON.stringify({ ok: parsed.ok, output: parsed.output, errorType: parsed.errorType, metadata: parsed.metadata }, null, 2)}`;
+  } catch {
+    return `Tool result:\n${content}`;
   }
 }

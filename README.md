@@ -1,150 +1,343 @@
 # Mini Code Agent
 
-## 中文
+Mini Code Agent is a Claude-Code-style terminal coding agent shell built around a local TypeScript agent core, with Pi available as the underlying ecosystem/runtime escape hatch.
 
-一个 clean-room TypeScript coding agent。它借鉴公开终端 coding harness 的通用架构思想：小核心、工具驱动循环、本地工作区访问、会话持久化和终端 UI。
+The default path is now Mini Shell: Mini Code owns the TUI, configuration, permission workflow, slash commands, plan workflow, session metadata, and `.mini-code/` state. Pi remains installed and can be invoked explicitly with `--pi-pass-through -- ...` while the Pi-engine integration is tightened.
 
-本项目不复制泄漏源码或专有源码。
+This project stays clean-room: it uses public npm packages, public docs, and public product behavior only. It does not copy leaked or proprietary source code.
 
-### 功能
-
-- 支持 OpenAI-compatible `/chat/completions` provider。
-- 支持 Anthropic Messages API provider。
-- 默认使用 Ink TUI。
-- 支持 `--plain` readline 简易终端模式。
-- 会话保存在当前项目的 `.mini-agent/sessions/`。
-- 对 shell 命令和敏感写入使用基于风险的权限确认。
-- 支持上下文压缩：优先使用 LLM 摘要，失败时回退到确定性摘要。
-- 自动读取配置来源，优先级如下：
-  1. CLI 参数
-  2. 进程环境变量
-  3. 项目内 `.env.local`
-  4. 项目内 `.env`
-  5. 默认值
-- 内置工具：
-  - `list_files`
-  - `search`
-  - `read_file`
-  - `replace_text`
-  - `create_file`
-  - `apply_patch`
-  - `run_command`
-  - `git_diff`
-
-### 安装
+## Quick Start
 
 ```bash
 npm install
-```
-
-OpenAI：
-
-```bash
-set MINI_AGENT_PROVIDER=openai
-set OPENAI_API_KEY=sk-...
-set OPENAI_MODEL=gpt-4.1-mini
-```
-
-Anthropic：
-
-```bash
-set MINI_AGENT_PROVIDER=anthropic
-set ANTHROPIC_API_KEY=sk-ant-...
-set ANTHROPIC_MODEL=claude-sonnet-4-20250514
-```
-
-OpenAI-compatible 本地服务：
-
-```bash
-set MINI_AGENT_PROVIDER=openai
-set OPENAI_API_KEY=ollama
-set OPENAI_BASE_URL=http://localhost:11434/v1
-set OPENAI_MODEL=qwen2.5-coder:7b
-```
-
-### 运行
-
-TUI：
-
-```bash
 npm run dev
 ```
 
-简易 CLI：
+Run against another workspace:
 
 ```bash
-npm run dev -- --plain
+npm run dev -- --cwd /path/to/repo
 ```
 
-常用参数：
+Non-interactive print mode:
 
 ```bash
-npm run dev -- --cwd D:\path\to\repo --model gpt-4.1-mini --max-turns 30
-npm run dev -- --provider anthropic --model claude-sonnet-4-20250514
-npm run dev -- --session 20260524120000-abc123
-npm run dev -- --new-session
-npm run dev -- --list-sessions
+npm run dev -- --plain "read README.md and summarize it"
 ```
 
-TUI 命令：
+`--plain` is translated to Pi's `--print` flag. Most other Pi flags pass through unchanged.
 
-- `/exit`
-- `/sessions`
-- `/clear`
-- `/compact`
-- `/expand`
+## Mini Shell
 
-权限确认：
+Useful Mini Code capabilities:
 
-- `y`：允许一次
-- `n`：拒绝
-- `a`：当前会话始终允许该工具或命令前缀
+| Capability | Usage |
+| --- | --- |
+| Interactive TUI | `npm run dev` |
+| Plain Mini Shell | `npm run dev -- --plain` |
+| Select provider | `npm run dev -- --provider openai` |
+| Select model | `npm run dev -- --model gpt-4o` |
+| Select plan model | `npm run dev -- --plan-model claude-sonnet-4-5` |
+| Permission mode | `npm run dev -- --permission-mode accept_edits` |
+| Create plan | `npm run dev -- --plain --plan "design the refactor"` |
+| Execute saved plan | `npm run dev -- --plain --execute-plan <plan-id>` |
+| Pi pass-through | `npm run dev -- --pi-pass-through -- --help` |
 
-### 架构
+Pi package currently installed: `@earendil-works/pi-coding-agent@0.75.5`.
 
-```text
-src/
-  index.ts              # 进程入口
-  cli/                  # 参数解析、.env 读取、plain readline
-  ui/                   # Ink TUI
-  core/                 # agent loop、事件、上下文压缩、共享类型
-  providers/            # 模型 API 适配器
-  tools/                # 工作区工具、patch、权限、路径安全
-  storage/              # 会话持久化
+Pi capabilities are available through pass-through:
+
+| Capability | Usage |
+| --- | --- |
+| Pi TUI | `npm run dev -- --pi-pass-through --` |
+| Pi print mode | `npm run dev -- --pi-pass-through -- --print "inspect src"` |
+| Pi JSON events | `npm run dev -- --pi-pass-through -- --mode json --print "inspect src"` |
+| Pi RPC mode | `npm run dev -- --pi-pass-through -- --mode rpc` |
+| Select provider | `npm run dev -- --provider openai` |
+| Select model | `npm run dev -- --model openai/gpt-4o` |
+| Plan mode | `npm run dev -- --plan "design the refactor"` |
+| Plan model | `npm run dev -- --plan-model claude-sonnet-4-5 --plan "design the refactor"` |
+| Thinking level | `npm run dev -- --model sonnet:high` or `--thinking high` |
+| Resume picker | `npm run dev -- --resume` |
+| Resume session | `npm run dev -- --session <id-or-path>` |
+| New ephemeral session | `npm run dev -- --new-session` |
+| Session directory | `npm run dev -- --session-dir .mini-code/sessions` |
+| Read-only tool set | `npm run dev -- --tools read,grep,find,ls` |
+| Disable tools | `npm run dev -- --no-tools` |
+| Disable context files | `npm run dev -- --no-context-files` |
+| Load extension | `npm run dev -- --extension ./my-extension.ts` |
+| Load skill | `npm run dev -- --skill ./skills/my-skill.md` |
+
+Pi's public CLI help is available with:
+
+```bash
+npm run dev -- --pi-pass-through -- --help
 ```
 
-依赖方向保持单向：
+## Interactive Commands
 
-```text
-cli/ui -> core -> providers/tools/storage
-tools/storage/providers -> core/types only
+Mini Shell provides Claude-Code-like workflows through slash commands and hotkeys. Common commands include:
+
+| Command | Purpose |
+| --- | --- |
+| `/help` | Show Mini Code commands. |
+| `/status` | Show effective session/config status. |
+| `/tools` | Show built-in workspace tools. |
+| `/permissions` | Show permission mode and remembered approvals. |
+| `/skills` | Show discovered Mini Code skills. |
+| `/skill:<name> <args>` | Load one skill into the next model turn. |
+| `/plan <request>` | Create a read-only implementation plan. |
+| `/execute <plan-id>` | Execute an approved/saved plan. |
+| `/resume` | Resume a previous session. |
+| `/new` | Start a new session. |
+| `/name` | Rename the current session. |
+| `/session` | Show the current session id. |
+| `/compact` | Compact context. |
+| `/summary` | Show current context summary. |
+| `/sessions` | List local sessions. |
+| `/rename <title>` | Rename current session. |
+| `/export-session <path>` | Export current session JSON. |
+| `/quit` | Exit. |
+
+Important Mini Shell hotkeys:
+
+| Hotkey | Purpose |
+| --- | --- |
+| `Shift+Tab` | Cycle permission mode: default -> accept edits -> bypass permissions. |
+| `Ctrl+C` | Exit. |
+
+Mini Code implements its own permission prompts for write, patch, shell, sensitive paths, deletes, and dangerous commands.
+
+## Plan Mode
+
+Mini Code supports two-stage plan mode:
+
+```bash
+npm run dev -- --plain --plan "design the auth refactor"
+npm run dev -- --plan-model claude-sonnet-4-5
 ```
 
-模型每轮返回一个 JSON 决策：
+Plan mode is intentionally different from normal coding mode:
 
-```json
-{"action":"tool","tool":"read_file","input":{"path":"src/index.ts"}}
+| Behavior | Description |
+| --- | --- |
+| Read-only planning | `/plan` uses the configured `planModel` and asks for a plan before execution. |
+| User confirmation | TUI offers `[y] execute`, `[n] cancel`, `[e] edit request` after a plan is created. |
+| Separate model | `--plan-model <model>` uses a planner model without changing normal `--model`. |
+| Env switch | `MINI_CODE_PLAN_MODE=true` enables plan mode. |
+| Env model | `MINI_CODE_PLAN_MODEL=<model>` selects the planner model. |
+
+The expected output is a concrete implementation plan: goal, relevant files, ordered steps, validation commands, risks, and open questions. It should not edit files or run mutating commands.
+
+## Tools And Context
+
+Pi's built-in tools are:
+
+| Tool | Purpose |
+| --- | --- |
+| `read` | Read file contents. |
+| `bash` | Execute shell commands. |
+| `edit` | Edit files with find/replace. |
+| `write` | Create or overwrite files. |
+| `grep` | Search file contents. |
+| `find` | Find files by glob. |
+| `ls` | List directory contents. |
+
+By default Pi gives the model `read`, `write`, `edit`, and `bash`. `grep`, `find`, and `ls` can be enabled with `--tools`.
+
+Pi discovers `AGENTS.md` and `CLAUDE.md` context files unless `--no-context-files` is passed.
+
+## Skills And Pi Ecosystem
+
+Mini Code supports an Agent Skills-compatible MVP in the Mini Shell while keeping Pi's richer ecosystem available through pass-through/RPC.
+
+Mini Shell discovers skills from:
+
+| Location | Notes |
+| --- | --- |
+| `.mini-code/skills/` | Mini Code project-local skills. |
+| `.agents/skills/` | Shared Agent Skills location. |
+| `.claude/skills/` | Project Claude Code skills. |
+| `.mini-code/config.json` `skills` | Extra explicit files or directories. |
+| `--skill <path>` | Extra explicit skill path, repeatable. |
+
+Supported skill format:
+
+```markdown
+---
+name: code-review
+description: Review code carefully before changes
+allowed-tools: read grep
+disable-model-invocation: false
+---
+
+# Code Review
+
+Read relevant files first and report risks.
 ```
 
-或：
+Commands:
 
-```json
-{"action":"final","answer":"Done."}
+```bash
+/skills
+/skill:code-review inspect auth flow
+npm run dev -- --skill ./.claude/skills/code-review
+npm run dev -- --no-skills
 ```
 
-编辑文件时，agent 会优先使用标准 unified diff patch：
+Mini Shell skills are text-only in this MVP: they are discovered, listed, injected into the prompt, and can be forced with `/skill:name`. They do not install packages or execute helper scripts automatically.
+
+For Pi packages, extensions, prompt templates, custom tools, and future MCP-style workflows, use Pi directly through pass-through while Mini Code's native engine integration matures:
+
+```bash
+npm run dev -- --pi-pass-through -- install npm:@org/pi-tools
+npm run dev -- --pi-pass-through -- config
+npm run dev -- --pi-pass-through -- --mode rpc
+```
+
+This keeps Mini Code responsible for permissions, planning, TUI, and config boundaries while still reusing Pi's mature ecosystem where it is stronger.
+
+## Wrapper Compatibility
+
+Mini Code Agent keeps a few old flags as aliases so existing commands do not immediately break:
+
+| Mini flag | Pi behavior |
+| --- | --- |
+| `--plain` | Runs the plain Mini Shell. |
+| `--cwd <path>` | Runs Pi with that working directory. |
+| `--new-session` | Translates to `--no-session`. |
+| `--list-sessions` | Translates to `--resume`. |
+| `--plan` | Enables Mini Code plan mode. |
+| `--plan-model <model>` | Uses a planner model for plan mode. |
+| `--execute-plan <id>` | Executes a saved plan in plain mode. |
+| `--skill <path>` | Adds a skill file or directory. |
+| `--no-skills` | Disables Mini Shell skill discovery. |
+| `--pi-pass-through -- <args>` | Directly invokes Pi for debugging/escape hatch. |
+| `--provider <name>` | Passed through. |
+| `--model <name>` | Passed through. |
+| `--session <id>` | Passed through. |
+| `--legacy` | Runs the old in-repo agent instead of Pi. |
+
+`--allow-dangerous`, `--base-url`, and `--max-turns` are Mini Shell flags. Pi-specific flags should be sent after `--pi-pass-through --`.
+
+## Authentication
+
+Use Pi's supported environment variables, `/login`, or the compatibility variables below. The wrapper loads `.env` and `.env.local` from the selected workspace before starting Pi. Shell environment variables still win over file values.
+
+Common API-key environment variables include:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
+export GEMINI_API_KEY=...
+export OPENROUTER_API_KEY=...
+```
+
+Pi also supports many other providers. Run `npm run dev -- --help` for the current list.
+
+### Compatibility Env
+
+Mini Code reads `.mini-code/config.json`, `.env.local`, `.env`, environment variables, and CLI args. CLI wins over env; env wins over files.
+
+The old Mini Code Agent environment variables still work as aliases:
+
+| Old variable | Pi wrapper behavior |
+| --- | --- |
+| `MINI_AGENT_PROVIDER` or `LLM_PROVIDER` | Adds `--provider <value>` unless `--provider` was passed explicitly. |
+| `MINI_AGENT_MODEL` or `LLM_MODEL` | Adds `--model <value>` unless `--model` was passed explicitly. |
+| `ANTHROPIC_MODEL` | Adds `--model <value>` when provider is `anthropic`. |
+| `OPENAI_MODEL` | Adds `--model <value>` when provider is `openai`. |
+| `GEMINI_MODEL` or `GOOGLE_MODEL` | Adds `--model <value>` when provider is `google`. |
+| `MINI_AGENT_API_KEY` or `LLM_API_KEY` | Copies into the provider API key env var when a provider is known. |
+| `OPENAI_BASE_URL` or `MINI_AGENT_BASE_URL` | Creates a project-local Pi `models.json` override for OpenAI-compatible endpoints. |
+| `MINI_CODE_PLAN_MODE` or `MINI_AGENT_PLAN_MODE` | Enables Mini Code plan mode when set to `true`, `1`, `yes`, or `on`. |
+| `MINI_CODE_PLAN_MODEL` or `MINI_AGENT_PLAN_MODEL` | Selects the model used by plan mode. |
+| `MINI_CODE_SKILLS` | Comma-separated skill files or directories. |
+| `MINI_CODE_NO_SKILLS` | Disables Mini Shell skills when truthy. |
+
+Example `.mini-code/config.json`:
 
 ```json
 {
-  "action": "tool",
-  "tool": "apply_patch",
-  "input": {
-    "patch": "--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new\n"
-  }
+  "provider": "openai",
+  "model": "gpt-4o",
+  "planModel": "claude-sonnet-4-5",
+  "permissionMode": "default",
+  "skills": [".claude/skills/code-review"],
+  "enableSkills": true
 }
 ```
 
-### 验证
+### Common Errors
+
+| Symptom | Meaning | Fix |
+| --- | --- | --- |
+| `call_id` or `tool_call_id` is empty | Provider received a native tool-result role without a matching tool call. | Mini Code converts internal tool results to user text before provider calls; update and rerun tests if this appears. |
+| API key or 401 error | Provider credentials are missing or wrong. | Check `/status`, `.env.local`, and provider env vars. |
+| OpenAI-compatible 404/base URL error | `OPENAI_BASE_URL` points at the wrong root. | Use a `/v1` compatible URL such as `http://localhost:11434/v1`. |
+| Skill not found | The skill path was not discovered or name differs. | Run `/skills` and use the listed name. |
+
+Example `.env.local` for Anthropic:
+
+```bash
+MINI_AGENT_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-5
+```
+
+Example `.env.local` for OpenAI:
+
+```bash
+MINI_AGENT_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+```
+
+Example `.env.local` for Ollama or another OpenAI-compatible local server:
+
+```bash
+MINI_AGENT_PROVIDER=openai
+OPENAI_API_KEY=ollama
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_MODEL=qwen2.5-coder:7b
+```
+
+Mini Code stores state in `.mini-code` by default. Pi pass-through also uses `.mini-code` as `PI_CODING_AGENT_DIR` unless overridden.
+
+When `OPENAI_BASE_URL`/`MINI_AGENT_BASE_URL` is set with an OpenAI model, the wrapper writes `.mini-code/models.json`. This keeps custom endpoint config local to the project instead of modifying `~/.pi/agent/models.json`.
+
+Explicit CLI flags always win over compatibility env values:
+
+```bash
+npm run dev -- --provider anthropic --model claude-sonnet-4-5
+```
+
+## Sessions
+
+Mini Code stores Pi state under `.mini-code/` by default. Pi sessions are therefore saved under `.mini-code/sessions/` unless `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, or `--session-dir` overrides that.
+
+Useful session commands:
+
+```bash
+npm run dev -- --resume
+npm run dev -- --session <id-or-path>
+npm run dev -- --fork <id-or-path>
+npm run dev -- --session-dir .mini-code/sessions
+npm run dev -- --no-session
+```
+
+## Legacy Mode
+
+The previous TypeScript + Ink implementation remains available:
+
+```bash
+npm run dev -- --legacy
+npm run dev -- --legacy --plain
+```
+
+Legacy mode still uses the old local architecture under `src/core`, `src/tools`, `src/providers`, `src/storage`, and `src/ui`. New product work should target the Pi wrapper path unless there is a specific reason to preserve old behavior.
+
+## Development
 
 ```bash
 npm run typecheck
@@ -152,154 +345,12 @@ npm test
 npm run build
 ```
 
-## English
+Scripts:
 
-A clean-room TypeScript coding agent inspired by common public terminal coding harness patterns: a small core, a tool-driven loop, local workspace access, session persistence, and a terminal UI.
-
-This project does not copy leaked or proprietary source code.
-
-### Features
-
-- OpenAI-compatible `/chat/completions` provider.
-- Anthropic Messages API provider.
-- Ink-based TUI by default.
-- `--plain` readline mode for simple terminals.
-- Project-local sessions in `.mini-agent/sessions/`.
-- Risk-based permissions for shell commands and sensitive writes.
-- Context compaction with an LLM summary and deterministic fallback.
-- Configuration loading priority:
-  1. CLI arguments
-  2. Process environment variables
-  3. Project `.env.local`
-  4. Project `.env`
-  5. Defaults
-- Built-in tools:
-  - `list_files`
-  - `search`
-  - `read_file`
-  - `replace_text`
-  - `create_file`
-  - `apply_patch`
-  - `run_command`
-  - `git_diff`
-
-### Setup
-
-```bash
-npm install
-```
-
-OpenAI:
-
-```bash
-set MINI_AGENT_PROVIDER=openai
-set OPENAI_API_KEY=sk-...
-set OPENAI_MODEL=gpt-4.1-mini
-```
-
-Anthropic:
-
-```bash
-set MINI_AGENT_PROVIDER=anthropic
-set ANTHROPIC_API_KEY=sk-ant-...
-set ANTHROPIC_MODEL=claude-sonnet-4-20250514
-```
-
-OpenAI-compatible local server:
-
-```bash
-set MINI_AGENT_PROVIDER=openai
-set OPENAI_API_KEY=ollama
-set OPENAI_BASE_URL=http://localhost:11434/v1
-set OPENAI_MODEL=qwen2.5-coder:7b
-```
-
-### Run
-
-TUI:
-
-```bash
-npm run dev
-```
-
-Plain CLI:
-
-```bash
-npm run dev -- --plain
-```
-
-Useful flags:
-
-```bash
-npm run dev -- --cwd D:\path\to\repo --model gpt-4.1-mini --max-turns 30
-npm run dev -- --provider anthropic --model claude-sonnet-4-20250514
-npm run dev -- --session 20260524120000-abc123
-npm run dev -- --new-session
-npm run dev -- --list-sessions
-```
-
-TUI commands:
-
-- `/exit`
-- `/sessions`
-- `/clear`
-- `/compact`
-- `/expand`
-
-Permission prompts:
-
-- `y`: allow once
-- `n`: deny
-- `a`: always allow that tool or command prefix for the current session
-
-### Architecture
-
-```text
-src/
-  index.ts              # process entrypoint
-  cli/                  # args, .env loading, plain readline mode
-  ui/                   # Ink TUI
-  core/                 # agent loop, events, compaction, shared types
-  providers/            # model API adapters
-  tools/                # workspace tools, patching, permissions, path safety
-  storage/              # session persistence
-```
-
-Dependency direction is intentionally one-way:
-
-```text
-cli/ui -> core -> providers/tools/storage
-tools/storage/providers -> core/types only
-```
-
-The model returns one JSON decision per turn:
-
-```json
-{"action":"tool","tool":"read_file","input":{"path":"src/index.ts"}}
-```
-
-or:
-
-```json
-{"action":"final","answer":"Done."}
-```
-
-For edits, the agent is instructed to prefer standard unified diff patches:
-
-```json
-{
-  "action": "tool",
-  "tool": "apply_patch",
-  "input": {
-    "patch": "--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new\n"
-  }
-}
-```
-
-### Verify
-
-```bash
-npm run typecheck
-npm test
-npm run build
-```
+| Script | Description |
+| --- | --- |
+| `npm run dev` | Run the source entrypoint with `tsx`. |
+| `npm run build` | Compile TypeScript to `dist/`. |
+| `npm run start` | Run compiled `dist/index.js`. |
+| `npm run typecheck` | Run TypeScript type checking. |
+| `npm test` | Run Node test runner tests. |

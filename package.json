@@ -15,6 +15,7 @@
     "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.75.5",
     "ink": "^5.2.1",
     "react": "^18.3.1"
   },

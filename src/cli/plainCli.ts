@@ -1,9 +1,11 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { AgentSession } from "../core/agent.js";
+import { SessionStore } from "../storage/sessionStore.js";
 import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval } from "../core/types.js";
+import type { CliArgs } from "./config.js";
 
-export async function runPlainCli(config: AgentConfig): Promise<void> {
+export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSessions: false, newSession: false, legacy: false, piPassThrough: false, piArgs: [] }): Promise<void> {
   output.write(`Mini Code Agent\n`);
   output.write(`cwd: ${config.cwd}\n`);
   output.write(`provider: ${config.provider}\n`);
@@ -11,8 +13,21 @@ export async function runPlainCli(config: AgentConfig): Promise<void> {
   output.write(`Type /exit to quit. Type /compact to compact context.\n\n`);
 
   const rl = createInterface({ input, output });
-  const session = await AgentSession.create(config, renderEvent, (approval) => askApproval(rl, approval));
+  let currentConfig = config;
+  let session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
   output.write(`session: ${session.id}\n\n`);
+
+  if (args.planRequest) {
+    const plan = await session.createPlan(args.planRequest);
+    output.write(`Plan ${plan.id} created with ${plan.model}\n\n${plan.answer}\n`);
+    rl.close();
+    return;
+  }
+  if (args.executePlanId) {
+    await session.executePlan(args.executePlanId);
+    rl.close();
+    return;
+  }
 
   while (true) {
     const request = (await rl.question("> ")).trim();
@@ -20,6 +35,76 @@ export async function runPlainCli(config: AgentConfig): Promise<void> {
     if (request === "/exit" || request === "/quit") break;
     if (request === "/compact") {
       await session.forceCompact();
+      continue;
+    }
+    if (request === "/help") {
+      output.write("/plan <request> /execute <plan-id> /skills /skill:<name> <args> /sessions /new /resume <id> /rename <title> /export-session <path> /compact /summary /status /tools /permissions /exit\n");
+      continue;
+    }
+    if (request === "/status") {
+      const record = session.getRecord();
+      const task = record.tasks?.at(-1);
+      output.write(`session=${session.id}\nmessages=${session.getMessageCount()}\nsummary=${session.getSummary() ? "yes" : "no"}\ntask=${task?.status ?? "none"}\ntools=${task?.toolCalls.length ?? 0}\n`);
+      continue;
+    }
+    if (request === "/tools") {
+      output.write(`${session.describeTools()}\n`);
+      continue;
+    }
+    if (request === "/permissions") {
+      output.write(`${session.describePermissions()}\n`);
+      continue;
+    }
+    if (request === "/skills") {
+      output.write(`${session.describeSkills()}\n`);
+      continue;
+    }
+    if (request.startsWith("/skill:")) {
+      const body = request.slice("/skill:".length).trim();
+      const [name = "", ...rest] = body.split(/\s+/);
+      output.write(`${await session.useSkill(name, rest.join(" "))}\n`);
+      continue;
+    }
+    if (request === "/summary") {
+      output.write(`${session.getSummary() || "[no summary]"}\n`);
+      continue;
+    }
+    if (request === "/sessions") {
+      await printSessions(currentConfig.sessionDir);
+      continue;
+    }
+    if (request.startsWith("/rename ")) {
+      const title = request.slice("/rename ".length).trim();
+      const renamed = await new SessionStore(currentConfig.sessionDir).rename(session.id, title);
+      output.write(`renamed session: ${renamed.title}\n`);
+      continue;
+    }
+    if (request.startsWith("/export-session ")) {
+      const exportPath = request.slice("/export-session ".length).trim();
+      const written = await new SessionStore(currentConfig.sessionDir).export(session.id, exportPath);
+      output.write(`exported session: ${written}\n`);
+      continue;
+    }
+    if (request.startsWith("/plan ")) {
+      const plan = await session.createPlan(request.slice("/plan ".length).trim());
+      output.write(`Plan ${plan.id} created. Run /execute ${plan.id} to execute.\n\n${plan.answer}\n`);
+      continue;
+    }
+    if (request.startsWith("/execute ")) {
+      await session.executePlan(request.slice("/execute ".length).trim());
+      continue;
+    }
+    if (request === "/new") {
+      currentConfig = { ...currentConfig, sessionId: undefined };
+      session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
+      output.write(`new session: ${session.id}\n`);
+      continue;
+    }
+    if (request.startsWith("/resume ")) {
+      const id = request.slice("/resume ".length).trim();
+      currentConfig = { ...currentConfig, sessionId: id };
+      session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
+      output.write(`resumed session: ${session.id}\n`);
       continue;
     }
 
@@ -34,15 +119,33 @@ export async function runPlainCli(config: AgentConfig): Promise<void> {
   rl.close();
 }
 
+async function printSessions(sessionDir: string): Promise<void> {
+  const sessions = await new SessionStore(sessionDir).list();
+  if (sessions.length === 0) {
+    output.write("No sessions\n");
+    return;
+  }
+  for (const session of sessions) {
+    output.write(`${session.id}\t${session.updatedAt}\t${session.model}\t${session.title}\t${session.summary.slice(0, 80)}\n`);
+  }
+}
+
 function renderEvent(event: AgentEvent): void {
   if (event.type === "model_response") return;
-  if (event.type === "tool_request") {
+  if (event.type === "plan") {
+    output.write(`\nPlan\n`);
+    for (const todo of event.todos) {
+      const marker = todo.status === "completed" ? "[x]" : todo.status === "in_progress" ? "[>]" : "[ ]";
+      output.write(`${marker} ${todo.content}\n`);
+    }
+  } else if (event.type === "tool_request") {
     output.write(`\n[${event.turn}] ${event.tool}: ${event.description}\n`);
     if (event.thought) output.write(`    ${event.thought}\n`);
   } else if (event.type === "tool_result") {
-    output.write(`${event.ok ? "ok" : "failed"} ${event.tool}\n${event.output}\n`);
+    output.write(`${event.ok ? "ok" : event.errorType ?? "failed"} ${event.tool}\n${event.output}\n`);
   } else if (event.type === "permission_request") {
     output.write(`permission: ${event.requirement.reason}\n`);
+    for (const detail of event.requirement.details ?? []) output.write(`  ${detail.label}: ${detail.value}\n`);
   } else if (event.type === "compaction") {
     output.write(`\nContext compacted.\n${event.summary}\n`);
   } else if (event.type === "final") {
@@ -54,9 +157,12 @@ function renderEvent(event: AgentEvent): void {
 
 async function askApproval(rl: ReturnType<typeof createInterface>, approval: PendingApproval): Promise<ApprovalDecision> {
   output.write(`\nPermission required: ${approval.requirement.reason}\n`);
+  for (const detail of approval.requirement.details ?? []) output.write(`${detail.label}: ${detail.value}\n`);
   output.write(`${approval.description}\n`);
-  const answer = (await rl.question("Allow? [y] once / [n] deny / [a] always: ")).trim().toLowerCase();
-  if (answer === "a") return "always_allow";
+  if (approval.requirement.blocked || approval.requirement.denied) return "deny";
+  const prompt = approval.requirement.rememberable === false ? "Allow? [y] once / [n] deny: " : "Allow? [y] once / [n] deny / [a] always exact scope: ";
+  const answer = (await rl.question(prompt)).trim().toLowerCase();
+  if (answer === "a" && approval.requirement.rememberable !== false) return "always_allow";
   if (answer === "y" || answer === "yes" || answer === "") return "allow_once";
   return "deny";
 }

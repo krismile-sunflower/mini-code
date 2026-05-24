@@ -2,18 +2,25 @@
 import React from "react";
 import { render } from "ink";
 import { buildConfig, readArgs } from "./cli/config.js";
+import { runPiCli } from "./cli/piWrapper.js";
 import { runPlainCli } from "./cli/plainCli.js";
 import { SessionStore } from "./storage/sessionStore.js";
 import { App } from "./ui/App.js";
 
 async function main(): Promise<void> {
   const args = readArgs();
+
+  if (args.piPassThrough) {
+    process.exitCode = await runPiCli(args.piArgs);
+    return;
+  }
+
   const config = buildConfig(args);
 
   if (args.listSessions) {
     const sessions = await new SessionStore(config.sessionDir).list();
     for (const session of sessions) {
-      console.log(`${session.id}\t${session.updatedAt}\t${session.model}\t${session.summary.slice(0, 80)}`);
+      console.log(`${session.id}\t${session.updatedAt}\t${session.model}\t${session.title}\t${session.summary.slice(0, 80)}`);
     }
     return;
   }
@@ -24,7 +31,7 @@ async function main(): Promise<void> {
   }
 
   if (config.plain) {
-    await runPlainCli(config);
+    await runPlainCli(config, args);
     return;
   }
 

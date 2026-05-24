@@ -2,10 +2,39 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 export type EnvMap = Record<string, string | undefined>;
+export type EnvSource = "env" | ".env.local" | ".env";
+
+export interface LoadedEnv {
+  values: EnvMap;
+  sources: Record<string, EnvSource | undefined>;
+}
 
 export function loadConfigEnv(cwd: string, shellEnv: EnvMap = process.env): EnvMap {
-  const fileEnv = readEnvFiles(cwd);
-  return { ...fileEnv, ...shellEnv };
+  return loadConfigEnvDetailed(cwd, shellEnv).values;
+}
+
+export function loadConfigEnvDetailed(cwd: string, shellEnv: EnvMap = process.env): LoadedEnv {
+  const values: EnvMap = {};
+  const sources: Record<string, EnvSource | undefined> = {};
+  for (const file of [".env", ".env.local"] as const) {
+    const parsed = readEnvFile(cwd, file);
+    Object.assign(values, parsed);
+    for (const key of Object.keys(parsed)) sources[key] = file;
+  }
+  for (const [key, value] of Object.entries(shellEnv)) {
+    if (value === undefined) continue;
+    values[key] = value;
+    sources[key] = "env";
+  }
+  return { values, sources };
+}
+
+function readEnvFile(cwd: string, file: ".env" | ".env.local"): EnvMap {
+  const values: EnvMap = {};
+  const filePath = path.join(cwd, file);
+  if (!existsSync(filePath)) return values;
+  Object.assign(values, parseEnvFile(readFileSync(filePath, "utf8")));
+  return values;
 }
 
 function readEnvFiles(cwd: string): EnvMap {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chat } from "./llm.js";
+import { chat, complete, toProviderMessages } from "./llm.js";
 
 test("chat sends OpenAI-compatible chat completions request", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -23,6 +23,65 @@ test("chat sends OpenAI-compatible chat completions request", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("complete normalizes OpenAI-compatible responses", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: '{"action":"final","answer":"ok"}' } }] });
+  try {
+    const result = await complete({
+      provider: "openai",
+      baseUrl: "https://api.openai.test/v1",
+      apiKey: "key",
+      model: "model",
+      messages: [{ role: "user", content: "hello" }]
+    });
+    assert.equal(result.provider, "openai");
+    assert.equal(result.model, "model");
+    assert.equal(result.raw, '{"action":"final","answer":"ok"}');
+    assert.equal(result.content, result.raw);
+    assert.deepEqual(result.streamEvents, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenAI-compatible conversion renders tool messages as user text", async () => {
+  const calls: Array<{ body: unknown }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return jsonResponse({ choices: [{ message: { content: "{\"action\":\"final\",\"answer\":\"ok\"}" } }] });
+  };
+  try {
+    await complete({
+      provider: "openai",
+      baseUrl: "https://api.openai.test/v1",
+      apiKey: "key",
+      model: "model",
+      messages: [
+        { role: "user", content: "read package.json" },
+        { role: "assistant", content: "{\"action\":\"tool\",\"tool\":\"read_file\",\"input\":{\"path\":\"package.json\"}}" },
+        { role: "tool", content: JSON.stringify({ tool: "read_file", ok: true, output: "package text", metadata: { path: "package.json" } }) }
+      ]
+    });
+    const body = calls[0]?.body as { messages: Array<{ role: string; content: string }> };
+    assert.equal(body.messages.some((message) => message.role === "tool"), false);
+    assert.equal(body.messages.at(-1)?.role, "user");
+    assert.match(body.messages.at(-1)?.content ?? "", /Tool result for read_file/);
+    assert.match(body.messages.at(-1)?.content ?? "", /package text/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("toProviderMessages merges tool result without call ids", () => {
+  const messages = toProviderMessages([
+    { role: "system", content: "rules" },
+    { role: "tool", content: JSON.stringify({ tool: "read_file", ok: true, output: "ok" }) }
+  ]);
+  assert.deepEqual(messages.map((message) => message.role), ["system", "user"]);
+  assert.match(messages[1]?.content ?? "", /Tool result for read_file/);
 });
 
 test("chat sends Anthropic messages request and converts system/tool roles", async () => {
@@ -54,6 +113,26 @@ test("chat sends Anthropic messages request and converts system/tool roles", asy
     assert.equal(body.messages.length, 1);
     assert.equal(body.messages[0].role, "user");
     assert.match(body.messages[0].content, /Tool result/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("complete normalizes Anthropic responses", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ content: [{ type: "text", text: "{\"action\":\"final\",\"answer\":\"ok\"}" }] });
+  try {
+    const result = await complete({
+      provider: "anthropic",
+      baseUrl: "https://api.anthropic.test/v1",
+      apiKey: "ant-key",
+      model: "claude",
+      messages: [{ role: "user", content: "hello" }]
+    });
+    assert.equal(result.provider, "anthropic");
+    assert.equal(result.model, "claude");
+    assert.equal(result.content, '{"action":"final","answer":"ok"}');
+    assert.deepEqual(result.streamEvents, []);
   } finally {
     globalThis.fetch = originalFetch;
   }

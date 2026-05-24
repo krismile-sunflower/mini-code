@@ -35,6 +35,26 @@ export function inspectPatch(patch: string): PatchSummary {
 }
 
 export async function applyUnifiedPatch(cwd: string, patch: string): Promise<string> {
+  const planned = await planUnifiedPatch(cwd, patch);
+
+  for (const [filePath, content] of planned.files) {
+    if (content === null) {
+      await fs.rm(filePath);
+    } else {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, content, "utf8");
+    }
+  }
+
+  return planned.messages.join("\n");
+}
+
+export async function checkUnifiedPatch(cwd: string, patch: string): Promise<string> {
+  const planned = await planUnifiedPatch(cwd, patch);
+  return [`Patch can be applied cleanly.`, ...planned.messages].join("\n");
+}
+
+async function planUnifiedPatch(cwd: string, patch: string): Promise<{ files: Map<string, string | null>; messages: string[] }> {
   const files = parseUnifiedDiff(patch);
   if (files.length === 0) throw new Error("Patch did not contain any file changes.");
 
@@ -52,16 +72,7 @@ export async function applyUnifiedPatch(cwd: string, patch: string): Promise<str
     messages.push(`${next === null ? "Deleted" : exists ? "Updated" : "Created"} ${targetPath}`);
   }
 
-  for (const [filePath, content] of planned) {
-    if (content === null) {
-      await fs.rm(filePath);
-    } else {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, content, "utf8");
-    }
-  }
-
-  return messages.join("\n");
+  return { files: planned, messages };
 }
 
 function parseUnifiedDiff(patch: string): FilePatch[] {

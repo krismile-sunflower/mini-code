@@ -5,6 +5,8 @@ import type { AgentEvent, Message, SessionRecord } from "../core/types.js";
 export interface SessionSummary {
   id: string;
   updatedAt: string;
+  title: string;
+  lastUserMessage: string;
   model: string;
   cwd: string;
   summary: string;
@@ -53,12 +55,33 @@ export class SessionStore {
       summaries.push({
         id: record.id,
         updatedAt: record.updatedAt,
+        title: record.title ?? "Untitled session",
+        lastUserMessage: record.lastUserMessage ?? "",
         model: record.model,
         cwd: record.cwd,
         summary: record.summary
       });
     }
     return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async rename(id: string, title: string): Promise<SessionRecord> {
+    const record = await this.load(id);
+    if (!record) throw new Error(`Session not found: ${id}`);
+    const trimmed = title.replace(/\s+/g, " ").trim();
+    if (!trimmed) throw new Error("Session title cannot be empty.");
+    const next = { ...record, title: trimmed };
+    await this.save(next);
+    return next;
+  }
+
+  async export(id: string, outputPath: string): Promise<string> {
+    const record = await this.load(id);
+    if (!record) throw new Error(`Session not found: ${id}`);
+    const resolved = path.resolve(outputPath);
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
+    await fs.writeFile(resolved, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    return resolved;
   }
 
   createRecord(input: { id?: string; cwd: string; provider: SessionRecord["provider"]; model: string; baseUrl: string; messages: Message[]; events?: AgentEvent[]; summary?: string }): SessionRecord {
@@ -73,6 +96,8 @@ export class SessionStore {
       baseUrl: input.baseUrl,
       messages: input.messages,
       events: input.events ?? [],
+      tasks: [],
+      plans: [],
       summary: input.summary ?? ""
     };
   }

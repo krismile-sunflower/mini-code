@@ -12,6 +12,37 @@ test("write_file writes content and creates parent directories", async () => {
     const result = await tool.run({ path: "nested/a.txt", content: "hello" });
     assert.equal(result.ok, true);
     assert.equal(await readFile(path.join(dir, "nested", "a.txt"), "utf8"), "hello");
+    assert.match(String(result.metadata?.diff), /\+hello/);
+    assert.deepEqual(result.metadata?.touchedPaths, ["nested/a.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("replace_text returns display diff metadata", async () => {
+  const dir = await tempDir();
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\ntwo\nthree\n", "utf8");
+    const tool = requiredTool(dir, "replace_text");
+    const result = await tool.run({ path: "a.txt", oldText: "two", newText: "TWO" });
+    assert.equal(result.ok, true);
+    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\nTWO\nthree\n");
+    assert.match(String(result.metadata?.diff), /-two/);
+    assert.match(String(result.metadata?.diff), /\+TWO/);
+    assert.equal(result.metadata?.firstChangedLine, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("create_file returns display diff metadata", async () => {
+  const dir = await tempDir();
+  try {
+    const tool = requiredTool(dir, "create_file");
+    const result = await tool.run({ path: "new.txt", content: "created\n" });
+    assert.equal(result.ok, true);
+    assert.match(String(result.metadata?.diff), /\+created/);
+    assert.deepEqual(result.metadata?.touchedPaths, ["new.txt"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -122,6 +153,8 @@ test("git_apply_check validates a patch without writing files", async () => {
     const result = await tool.run({ patch: "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n" });
     assert.equal(result.ok, true);
     assert.match(result.output, /Patch can be applied cleanly/);
+    assert.match(String(result.metadata?.patch), /-old/);
+    assert.equal(result.metadata?.checked, true);
     assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "old\n");
   } finally {
     await rm(dir, { recursive: true, force: true });

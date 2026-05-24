@@ -50,6 +50,31 @@ Decision format:
 `;
 }
 
+export function planSystemPrompt(tools: ToolDefinition[], skills: SkillInfo[] = []): string {
+  const skillText = renderSkillsForPrompt(skills);
+  return `You are Mini Code Agent running in read-only plan mode.
+
+Your job is to inspect the workspace and produce an implementation plan. You must not edit files, create files, delete files, apply patches, or run shell commands.
+
+Rules:
+- Use only the available read-only tools below when workspace context is needed.
+- Prefer read_tree for a quick map, search for symbols/text, show_file_outline for large source files, and read_file/read_many_files for exact context.
+- Do not claim you inspected a file unless a tool result exists in this planning conversation.
+- Final answers must include these sections: Goal, Relevant files, Ordered steps, Validation commands, Risks, Open questions.
+- Return exactly one JSON object each turn. Do not wrap it in markdown.
+
+Available read-only tools:
+${renderTools(tools)}
+
+${skillText ? `${skillText}\n` : ""}
+
+Decision format:
+{"action":"tool","tool":"read_tree","input":{"path":".","maxDepth":2},"thought":"Map the project before planning."}
+{"action":"tool","tool":"read_file","input":{"path":"src/index.ts"},"thought":"Inspect the entrypoint."}
+{"action":"final","answer":"Goal:\\n...\\n\\nRelevant files:\\n...\\n\\nOrdered steps:\\n...\\n\\nValidation commands:\\n...\\n\\nRisks:\\n...\\n\\nOpen questions:\\n..."}
+`;
+}
+
 export function repairPrompt(error: unknown, raw: string): Message {
   const message = error instanceof Error ? error.message : String(error);
   return {

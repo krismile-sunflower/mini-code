@@ -61,6 +61,7 @@ export interface ToolCall {
 
 export type ModelStreamEvent =
   | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; text: string }
   | { type: "tool_call_delta"; text: string };
 
 export interface ModelResponse {

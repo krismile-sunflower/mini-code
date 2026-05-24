@@ -6,18 +6,20 @@ import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval, PlanRe
 import {
   approvalRows,
   blockedApprovalText,
+  commandGroups,
   detailForItem,
   decisionText,
+  emptyStates,
   eventToTimelineItems,
+  headerFields,
   nextPermissionMode,
-  outputPreview,
   permissionModeLabel,
+  renderDiffLines,
   slashCommands,
+  stateColor,
   statusModel,
   timelineLabel,
-  todoLabel,
   truncateEnd,
-  truncateMiddle,
   type StatusModel,
   type TimelineItem
 } from "./renderModel.js";
@@ -27,7 +29,6 @@ export function App({ config }: { config: AgentConfig }) {
   const [activeConfig, setActiveConfig] = useState(config);
   const [input, setInput] = useState("");
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
-  const [todos, setTodos] = useState<import("../core/types.js").TaskTodo[]>([]);
   const [busy, setBusy] = useState(false);
   const [sessionId, setSessionId] = useState(config.sessionId ?? "starting");
   const [turn, setTurn] = useState(0);
@@ -37,6 +38,7 @@ export function App({ config }: { config: AgentConfig }) {
   const [pendingPlan, setPendingPlan] = useState<PlanRecord | undefined>();
   const [expanded, setExpanded] = useState(false);
   const [historyMode, setHistoryMode] = useState(false);
+  const [detailsVisible, setDetailsVisible] = useState(false);
   const [permissionMode, setPermissionMode] = useState(activeConfig.permissionMode);
   const sessionRef = useRef<AgentSession | undefined>();
 
@@ -46,7 +48,6 @@ export function App({ config }: { config: AgentConfig }) {
 
   const handleEvent = (event: AgentEvent) => {
     if (event.type === "tool_request") setTurn(event.turn);
-    if (event.type === "plan") setTodos(event.todos);
     if (event.type !== "permission_request" || event.id === "blocked") {
       pushItems(...eventToTimelineItems(event));
     }
@@ -78,7 +79,6 @@ export function App({ config }: { config: AgentConfig }) {
     setTurn(0);
     setMessageCount(0);
     setHasSummary(false);
-    setTodos([]);
     setPermissionMode(nextConfig.permissionMode);
     if (clearTimeline) setTimeline([]);
     const session = await AgentSession.create(nextConfig, handleEvent, approvalPromise);
@@ -149,6 +149,9 @@ export function App({ config }: { config: AgentConfig }) {
       } else if (trimmed === "/history") {
         setHistoryMode((value) => !value);
         pushItems({ kind: "session", text: `History ${historyMode ? "normal" : "extended"}` });
+      } else if (trimmed === "/details") {
+        setDetailsVisible((value) => !value);
+        pushItems({ kind: "session", text: `Details ${detailsVisible ? "hidden" : "visible"}` });
       } else if (trimmed.startsWith("/plan ")) {
         const request = trimmed.slice("/plan ".length).trim();
         const plan = await session.createPlan(request);
@@ -217,7 +220,7 @@ export function App({ config }: { config: AgentConfig }) {
 
   const visibleItems = useMemo(() => timeline.slice(historyMode ? -90 : -28), [historyMode, timeline]);
   const status = statusModel({ config: activeConfig, sessionId, turn, busy, approval, messageCount, hasSummary, permissionMode });
-  const latestDetail = useMemo(() => detailForItem([...visibleItems].reverse().find((item) => item.kind !== "thinking"), expanded), [expanded, visibleItems]);
+  const latestDetail = useMemo(() => detailForItem([...visibleItems].reverse()[0], expanded), [expanded, visibleItems]);
 
   function finishApproval(decision: ApprovalDecision) {
     approval?.resolve(decision);
@@ -235,18 +238,11 @@ export function App({ config }: { config: AgentConfig }) {
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <StatusBar status={status} />
-      <Box marginTop={1} gap={1}>
-        <Box width="36%" flexDirection="column">
-          <TaskPanel todos={todos} busy={busy} />
-        </Box>
-        <Box width="64%" flexDirection="column">
-          <TimelinePanel items={visibleItems} expanded={expanded} />
-        </Box>
-      </Box>
-      {latestDetail ? <DetailPanel detail={latestDetail} /> : null}
+      <HeaderBar status={status} />
+      <TimelinePanel items={visibleItems} expanded={expanded} detailsVisible={detailsVisible} historyMode={historyMode} />
+      {detailsVisible ? <DetailPanel detail={latestDetail} /> : null}
       {input === "/" ? <CommandMenu /> : null}
-      {approval ? <ApprovalPanel approval={approval} /> : pendingPlan ? <PlanApprovalPanel plan={pendingPlan} /> : <InputPanel busy={busy} input={input} expanded={expanded} historyMode={historyMode} />}
+      {approval ? <ApprovalPanel approval={approval} /> : pendingPlan ? <PlanApprovalPanel plan={pendingPlan} /> : <InputBar busy={busy} input={input} permissionMode={permissionMode} detailsVisible={detailsVisible} expanded={expanded} />}
     </Box>
   );
 }
@@ -263,73 +259,90 @@ function PlanApprovalPanel({ plan }: { plan: PlanRecord }) {
   );
 }
 
-function StatusBar({ status }: { status: StatusModel }) {
+function HeaderBar({ status }: { status: StatusModel }) {
+  const fields = headerFields(status);
   return (
-    <Box borderStyle="round" borderColor={status.state === "permission" ? "yellow" : status.state === "running" ? "blue" : "gray"} paddingX={1} justifyContent="space-between">
-      <Text color="cyan">Mini Code</Text>
-      <Text color={status.state === "permission" ? "yellow" : status.state === "running" ? "blue" : "gray"}>{status.state}</Text>
-      <Text>{status.provider}:{truncateMiddle(status.model, 24)}</Text>
-      <Text>mode {permissionModeLabel(status.permissionMode)}</Text>
-      <Text>cwd {status.cwd}</Text>
-      <Text>turn {status.turn}</Text>
-      <Text>msg {status.messages}</Text>
-      <Text>sum {status.summary ? "on" : "off"}</Text>
-      <Text>session {status.session}</Text>
+    <Box borderStyle="single" borderColor={stateColor(status.state)} paddingX={1}>
+      <Box width={12}>
+        <Text color="cyan" bold>Mini Code</Text>
+      </Box>
+      {fields.map((field) => (
+        <Box key={field.label} marginRight={2}>
+          <Text color="gray">{field.label}</Text>
+          <Text color="gray">=</Text>
+          <Text color={field.color ?? "white"}>{field.value}</Text>
+        </Box>
+      ))}
     </Box>
   );
 }
 
 function CommandMenu() {
   return (
-    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" marginTop={1}>
-      <Text color="cyan">Commands</Text>
-      {slashCommands.map((command) => <Text key={command}>{command}</Text>)}
-    </Box>
-  );
-}
-
-function TaskPanel({ todos, busy }: { todos: import("../core/types.js").TaskTodo[]; busy: boolean }) {
-  const completed = todos.filter((todo) => todo.status === "completed").length;
-  return (
-    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" minHeight={10}>
+    <Box borderStyle="single" borderColor="cyan" paddingX={1} flexDirection="column" marginTop={1}>
       <Box justifyContent="space-between">
-        <Text color="cyan">Task</Text>
-        <Text color={busy ? "blue" : "gray"}>{busy ? "running" : "idle"}</Text>
+        <Text color="cyan" bold>Commands</Text>
+        <Text color="gray">type a command and press enter</Text>
       </Box>
-      <Text color="gray">plan {todos.length ? `${completed}/${todos.length}` : "none"}</Text>
-      {todos.length === 0 ? <Text color="gray">No active plan</Text> : todos.slice(0, 8).map((todo) => <Text key={todo.id}>{todoLabel(todo)}</Text>)}
-      {todos.length > 8 ? <Text color="gray">... {todos.length - 8} more</Text> : null}
+      <Box gap={3} flexWrap="wrap">
+        {commandGroups.map((group) => (
+          <Box key={group.title} flexDirection="column" minWidth={24}>
+            <Text color="gray">{group.title}</Text>
+            {group.commands.map((command) => (
+              <Text key={command}>{command}</Text>
+            ))}
+          </Box>
+        ))}
+      </Box>
     </Box>
   );
 }
 
-function TimelinePanel({ items }: { items: TimelineItem[]; expanded: boolean }) {
+function TimelinePanel({ items, expanded, detailsVisible, historyMode }: { items: TimelineItem[]; expanded: boolean; detailsVisible: boolean; historyMode: boolean }) {
   return (
-    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" minHeight={10}>
+    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" minHeight={18} marginTop={1}>
       <Box justifyContent="space-between">
-        <Text color="cyan">Timeline</Text>
-        <Text color="gray">latest {items.length}</Text>
+        <Text color="cyan" bold>Conversation</Text>
+        <Text color="gray">latest {items.length}  details {detailsVisible ? "on" : "off"}  history {historyMode ? "extended" : "normal"}  diff {expanded ? "expanded" : "compact"}</Text>
       </Box>
-      {items.length === 0 ? <Text color="gray">No activity yet</Text> : items.slice(-14).map((item, index) => <TimelineRow key={`${index}-${item.kind}`} item={item} />)}
+      {items.length === 0 ? <Text color="gray">{emptyStates.timeline}</Text> : items.slice(-24).map((item, index) => <TimelineRow key={`${index}-${item.kind}`} item={item} expanded={expanded} />)}
     </Box>
   );
 }
 
-function TimelineRow({ item }: { item: TimelineItem }) {
+function TimelineRow({ item, expanded }: { item: TimelineItem; expanded: boolean }) {
   const label = timelineLabel(item);
+  const diffPreview = item.kind === "code_change" ? renderDiffLines(item.diff, expanded).slice(0, expanded ? 14 : 6) : [];
   return (
-    <Box>
-      <Box width={18}><Text color={label.color}>{truncateEnd(label.marker, 16)}</Text></Box>
-      <Text>{truncateEnd(label.text.replace(/\s+/g, " "), 110)}</Text>
+    <Box flexDirection="column">
+      <Box>
+        <Box width={12}>
+          <Text color={label.color}>{truncateEnd(label.marker, 10)}</Text>
+        </Box>
+        <Text color={label.severity === "muted" ? "gray" : "white"}>{truncateEnd(label.text.replace(/\s+/g, " "), 126)}</Text>
+      </Box>
+      {diffPreview.length > 0 ? (
+        <Box marginLeft={12} flexDirection="column">
+          {diffPreview.map((line, index) => (
+            <Text key={`${index}-${line.text}`} color={line.color}>{truncateEnd(line.text, 126)}</Text>
+          ))}
+        </Box>
+      ) : null}
     </Box>
   );
 }
 
-function DetailPanel({ detail }: { detail: NonNullable<ReturnType<typeof detailForItem>> }) {
+function DetailPanel({ detail }: { detail: ReturnType<typeof detailForItem> }) {
   return (
-    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" marginTop={1}>
-      <Text color={detail.color}>{detail.title}</Text>
-      <Text>{truncateEnd(detail.body, 2200)}</Text>
+    <Box borderStyle="single" borderColor={detail?.color ?? "gray"} paddingX={1} flexDirection="column" marginTop={1} minHeight={5}>
+      <Box justifyContent="space-between">
+        <Text color={detail?.color ?? "gray"} bold>{detail?.title ?? "Detail"}</Text>
+        <Text color="gray">{detail?.type ?? "empty"}</Text>
+      </Box>
+      <Text color={detail ? "white" : "gray"}>{detail ? truncateEnd(detail.body, 2200) : emptyStates.detail}</Text>
+      {detail?.diffLines?.map((line, index) => (
+        <Text key={`${index}-${line.text}`} color={line.color}>{line.text}</Text>
+      ))}
     </Box>
   );
 }
@@ -338,11 +351,14 @@ function ApprovalPanel({ approval }: { approval: PendingApproval }) {
   const blocked = Boolean(approval.requirement.denied || approval.requirement.blocked);
   return (
     <Box borderStyle="double" borderColor={blocked ? "red" : "yellow"} paddingX={1} flexDirection="column" marginTop={1}>
-      <Text color={blocked ? "red" : "yellow"}>{blocked ? "Permission Blocked" : "Permission Required"}</Text>
+      <Box justifyContent="space-between">
+        <Text color={blocked ? "red" : "yellow"} bold>{blocked ? "Permission Blocked" : "Permission Required"}</Text>
+        <Text color={blocked ? "red" : "yellow"}>{approval.tool}</Text>
+      </Box>
       <Text>{approval.requirement.reason}</Text>
       {approvalRows(approval).map((row) => (
         <Text key={`${row.label}-${row.value}`}>
-          {row.label}: {row.value}
+          <Text color="gray">{row.label}</Text>: {row.value}
         </Text>
       ))}
       <Text color={blocked ? "red" : "yellow"}>{blockedApprovalText(approval)}</Text>
@@ -350,11 +366,11 @@ function ApprovalPanel({ approval }: { approval: PendingApproval }) {
   );
 }
 
-function InputPanel({ busy, input, expanded, historyMode }: { busy: boolean; input: string; expanded: boolean; historyMode: boolean }) {
+function InputBar({ busy, input, permissionMode, detailsVisible, expanded }: { busy: boolean; input: string; permissionMode: StatusModel["permissionMode"]; detailsVisible: boolean; expanded: boolean }) {
   return (
-    <Box borderStyle="round" borderColor={busy ? "blue" : "gray"} paddingX={1} flexDirection="column" marginTop={1}>
-      <Text color="cyan">{busy ? "running" : ">"} {input || (busy ? "" : "Ask for a code change or type /help")}</Text>
-      <Text color="gray">shift+tab permission mode  expand {expanded ? "on" : "off"}  history {historyMode ? "extended" : "normal"}</Text>
+    <Box borderStyle="single" borderColor={busy ? "blue" : "gray"} paddingX={1} flexDirection="column" marginTop={1}>
+      <Text color={busy ? "blue" : "cyan"}>{busy ? "running" : ">"} {input || (busy ? "waiting for model" : "Ask, or type / for commands")}</Text>
+      <Text color="gray">shift+tab {permissionModeLabel(permissionMode)}  |  /details {detailsVisible ? "on" : "off"}  |  /expand {expanded ? "on" : "off"}  |  / commands</Text>
     </Box>
   );
 }

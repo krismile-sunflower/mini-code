@@ -1,6 +1,28 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approvalRows, blockedApprovalText, detailForItem, eventToTimelineItems, nextPermissionMode, outputPreview, permissionModeLabel, slashCommands, statusModel, todoLabel, toolRequestLabel } from "./renderModel.js";
+import {
+  approvalRows,
+  blockedApprovalText,
+  codeChangeFromToolRequest,
+  codeChangeFromToolResult,
+  commandGroups,
+  detailForItem,
+  diffSummary,
+  emptyStates,
+  eventToTimelineItems,
+  headerFields,
+  nextPermissionMode,
+  outputPreview,
+  piLikeModelEventsToTimeline,
+  permissionModeLabel,
+  renderDiffLines,
+  slashCommands,
+  stateColor,
+  statusModel,
+  timelineLabel,
+  todoLabel,
+  toolRequestLabel
+} from "./renderModel.js";
 import type { AgentConfig, PendingApproval } from "../core/types.js";
 
 test("eventToTimelineItems splits thought and tool request", () => {
@@ -15,6 +37,20 @@ test("eventToTimelineItems splits thought and tool request", () => {
   assert.equal(items.length, 2);
   assert.equal(items[0]?.kind, "thinking");
   assert.equal(items[1]?.kind, "tool_request");
+});
+
+test("eventToTimelineItems maps Pi-like stream text and thinking deltas", () => {
+  const items = eventToTimelineItems({
+    type: "model_response",
+    raw: "stream",
+    streamEvents: [
+      { type: "thinking_delta", text: "Need context. " },
+      { type: "text_delta", text: "I will inspect files." }
+    ]
+  });
+  assert.equal(items[0]?.kind, "thinking");
+  assert.equal(items[1]?.kind, "assistant_text");
+  assert.equal(piLikeModelEventsToTimeline([{ type: "text_delta", text: "{\"action\":\"final\",\"answer\":\"ok\"}" }]).length, 0);
 });
 
 test("eventToTimelineItems maps plan events", () => {
@@ -70,6 +106,62 @@ test("eventToTimelineItems maps validation tool results", () => {
   assert.equal(items[0]?.kind === "tool_result" ? items[0].status : undefined, "validation_error");
 });
 
+test("apply_patch tool request creates a planned code change item", () => {
+  const event = {
+    type: "tool_request" as const,
+    turn: 1,
+    tool: "apply_patch",
+    description: "Apply patch",
+    input: { patch: "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n" }
+  };
+  const items = eventToTimelineItems(event);
+  const change = items.find((item) => item.kind === "code_change");
+  assert.equal(change?.kind, "code_change");
+  assert.equal(change?.kind === "code_change" ? change.status : undefined, "planned");
+  assert.match(change?.kind === "code_change" ? change.summary : "", /edit a\.txt \+1 -1/);
+  assert.equal(codeChangeFromToolRequest(event)?.files[0], "a.txt");
+});
+
+test("git_apply_check tool request creates a checked code change item", () => {
+  const change = codeChangeFromToolRequest({
+    type: "tool_request",
+    turn: 1,
+    tool: "git_apply_check",
+    description: "Check patch",
+    input: { patch: "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n" }
+  });
+  assert.equal(change?.status, "checked");
+  assert.match(change?.summary ?? "", /check a\.txt \+1 -1/);
+});
+
+test("tool result diff metadata creates an applied code change item", () => {
+  const change = codeChangeFromToolResult({
+    type: "tool_result",
+    turn: 2,
+    tool: "replace_text",
+    ok: true,
+    output: "Updated a.txt",
+    metadata: {
+      path: "a.txt",
+      diff: "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n"
+    }
+  });
+  assert.equal(change?.status, "applied");
+  assert.equal(timelineLabel(change!).marker, "edit");
+});
+
+test("timeline labels map high-signal states to stable markers and colors", () => {
+  assert.deepEqual(timelineLabel({ kind: "user", text: "hello" }), { marker: "user", color: "white", text: "hello", severity: "neutral" });
+  assert.equal(timelineLabel({ kind: "plan", turn: 1, todos: [{ id: "1", content: "Read", status: "completed" }] }).marker, "plan");
+  assert.equal(timelineLabel({ kind: "tool_request", turn: 1, tool: "read_file", description: "Read", input: { path: "package.json" } }).color, "blue");
+  assert.equal(timelineLabel({ kind: "code_change", tool: "apply_patch", status: "planned", files: ["a.txt"], diff: "", summary: "edit a.txt +1 -1" }).marker, "edit");
+  assert.equal(timelineLabel({ kind: "tool_result", turn: 1, tool: "read_file", ok: true, output: "ok", status: "ok" }).severity, "success");
+  assert.equal(timelineLabel({ kind: "tool_result", turn: 1, tool: "read_file", ok: false, output: "bad", status: "validation_error" }).color, "yellow");
+  assert.equal(timelineLabel({ kind: "permission", text: "Blocked", risk: "dangerous", blocked: true }).marker, "blocked");
+  assert.equal(timelineLabel({ kind: "final", text: "Done" }).color, "green");
+  assert.equal(timelineLabel({ kind: "error", category: "runtime", text: "Boom" }).severity, "danger");
+});
+
 test("eventToTimelineItems folds protocol correction noise", () => {
   const items = eventToTimelineItems({ type: "error", category: "protocol", error: "A workspace tool is required before the final answer. Asking the model to call a tool." });
   assert.deepEqual(items, []);
@@ -78,6 +170,28 @@ test("eventToTimelineItems folds protocol correction noise", () => {
 test("detailForItem adds provider error suggestions", () => {
   const detail = detailForItem({ kind: "error", category: "runtime", text: "Invalid input[7].call_id: empty string" }, false);
   assert.match(detail?.body ?? "", /Provider rejected tool-message shape/);
+  assert.equal(detail?.type, "error");
+});
+
+test("detailForItem renders code changes with colored diff lines", () => {
+  const detail = detailForItem({
+    kind: "code_change",
+    tool: "apply_patch",
+    status: "planned",
+    files: ["a.txt"],
+    diff: "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+    summary: "edit a.txt +1 -1"
+  }, false);
+  assert.equal(detail?.type, "code_change");
+  assert.equal(detail?.diffLines?.some((line) => line.text === "-old" && line.color === "red"), true);
+  assert.equal(detail?.diffLines?.some((line) => line.text === "+new" && line.color === "green"), true);
+  assert.match(diffSummary("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n"), /edit a\.txt \+1 -1/);
+});
+
+test("renderDiffLines clips long diffs unless expanded", () => {
+  const diff = Array.from({ length: 40 }, (_, index) => `+line ${index}`).join("\n");
+  assert.match(renderDiffLines(diff, false).at(-1)?.text ?? "", /truncated/);
+  assert.doesNotMatch(renderDiffLines(diff, true).at(-1)?.text ?? "", /truncated/);
 });
 
 test("outputPreview clips long output unless expanded", () => {
@@ -98,8 +212,29 @@ test("statusModel truncates long cwd and session", () => {
   });
   assert.equal(status.state, "running");
   assert.equal(status.permissionMode, "default");
+  assert.equal(status.planModel, "test-model");
   assert.ok(status.cwd.length <= 40);
   assert.ok(status.session.length <= 22);
+});
+
+test("header model exposes Claude Code style compact fields", () => {
+  const status = statusModel({
+    config: { ...config(), planModel: "planner-model" },
+    sessionId: "session-123",
+    turn: 4,
+    busy: false,
+    approval: pendingApproval(),
+    messageCount: 18,
+    hasSummary: true,
+    permissionMode: "accept_edits"
+  });
+  const fields = headerFields(status);
+  assert.equal(status.state, "permission");
+  assert.equal(stateColor(status.state), "yellow");
+  assert.ok(fields.some((field) => field.label === "model" && field.value.includes("openai:test-model")));
+  assert.ok(fields.some((field) => field.label === "plan" && field.value === "planner-model"));
+  assert.ok(fields.some((field) => field.label === "mode" && field.value === "accept edits"));
+  assert.ok(fields.some((field) => field.label === "summary" && field.value === "on"));
 });
 
 test("permission mode helpers cycle Claude Code style modes", () => {
@@ -108,6 +243,16 @@ test("permission mode helpers cycle Claude Code style modes", () => {
   assert.equal(nextPermissionMode("bypass_permissions"), "default");
   assert.equal(permissionModeLabel("accept_edits"), "accept edits");
   assert.ok(slashCommands.includes("/permissions"));
+});
+
+test("command groups keep slash menu stable and grouped", () => {
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/help")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/permissions")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/skills")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/plan <request>")));
+  assert.ok(commandGroups.some((group) => group.title === "View" && group.commands.includes("/details")));
+  assert.ok(slashCommands.includes("/status"));
+  assert.match(emptyStates.timeline, /No activity/);
 });
 
 function pendingApproval(): PendingApproval {

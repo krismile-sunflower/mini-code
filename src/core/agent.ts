@@ -1,7 +1,7 @@
 import { maybeCompactMessages } from "./compaction.js";
 import { parseDecision } from "./decision.js";
 import { fallbackReadFilePath, finalClaimsToolUse, requiresPlan, requiresWorkspaceTool } from "./policy.js";
-import { executePlanRequest, planModeRequest, planRequiredCorrection, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
+import { executePlanRequest, planModeRequest, planRequiredCorrection, planSystemPrompt, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
 import { discoverSkills, renderSkillList, skillInjection } from "./skills.js";
 import { complete } from "../providers/llm.js";
 import { commandPrefix } from "../tools/permissions.js";
@@ -59,6 +59,11 @@ function touchTask(task: TaskRecord): void {
   task.updatedAt = new Date().toISOString();
 }
 
+function selectToolsForPolicy(tools: ToolDefinition[], policy: AgentConfig["toolsPolicy"]): ToolDefinition[] {
+  if (policy === "read_only") return tools.filter((tool) => tool.risk === "read");
+  return tools;
+}
+
 export class AgentSession {
   readonly id: string;
   private readonly tools: Map<string, ToolDefinition>;
@@ -98,7 +103,7 @@ export class AgentSession {
   }
 
   static async create(config: AgentConfig, onEvent: AgentEventHandler, onApproval: ApprovalHandler): Promise<AgentSession> {
-    const toolList = createTools(config.cwd, config.maxToolOutputChars, config.allowDangerousCommands);
+    const toolList = selectToolsForPolicy(createTools(config.cwd, config.maxToolOutputChars, config.allowDangerousCommands), config.toolsPolicy);
     const skills = await discoverSkills(config.cwd, config.skills, config.enableSkills);
     const store = new SessionStore(config.sessionDir);
     await store.ensure();
@@ -217,20 +222,77 @@ export class AgentSession {
   }
 
   async createPlan(userRequest: string): Promise<PlanRecord> {
-    const previousMessages = this.messages;
-    const planMessages = [previousMessages[0] ?? { role: "system" as const, content: systemPrompt(Array.from(this.tools.values())) }, planModeRequest(userRequest)];
-    const response = await complete({
-      provider: this.config.provider,
-      baseUrl: this.config.baseUrl,
-      apiKey: this.config.apiKey,
-      model: this.config.planModel,
-      messages: planMessages
-    });
-    const plan = parsePlanRecord(userRequest, this.config.planModel, response.content);
-    this.record.plans = [...(this.record.plans ?? []), plan];
-    await this.emit({ type: "final", answer: response.content });
-    await this.persist();
-    return plan;
+    const readOnlyTools = Array.from(this.tools.values()).filter((tool) => tool.risk === "read");
+    const readOnlyToolMap = new Map(readOnlyTools.map((tool) => [tool.name, tool]));
+    const planMessages: Message[] = [
+      { role: "system", content: planSystemPrompt(readOnlyTools, this.skills) },
+      ...(this.summary ? [{ role: "user" as const, content: `Current session summary:\n${this.summary}` }] : []),
+      planModeRequest(userRequest)
+    ];
+    let lastError: string | undefined;
+
+    for (let turn = 1; turn <= this.config.maxTurns; turn += 1) {
+      const response = await complete({
+        provider: this.config.provider,
+        baseUrl: this.config.baseUrl,
+        apiKey: this.config.apiKey,
+        model: this.config.planModel,
+        messages: planMessages
+      });
+      planMessages.push({ role: "assistant", content: response.content });
+      await this.emit({ type: "model_response", raw: response.raw, content: response.content, provider: response.provider, model: response.model, streamEvents: response.streamEvents });
+
+      let decision: AgentDecision;
+      try {
+        decision = parseDecision(response.content, readOnlyToolMap);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        await this.emit({ type: "error", category: "parse", error: lastError });
+        planMessages.push(repairPrompt(error, response.content));
+        await this.persist();
+        continue;
+      }
+
+      if (decision.action === "plan") {
+        const todos = createTodos(decision.todos ?? []);
+        await this.emit({ type: "plan", turn, todos });
+        planMessages.push({ role: "user", content: "Planning todos noted. Continue with read-only inspection if useful, then return a final JSON answer containing the implementation plan." });
+        await this.persist();
+        continue;
+      }
+
+      if (decision.action === "final") {
+        const answer = decision.answer ?? "";
+        const plan = parsePlanRecord(userRequest, this.config.planModel, answer);
+        this.record.plans = [...(this.record.plans ?? []), plan];
+        await this.persist();
+        return plan;
+      }
+
+      const tool = readOnlyToolMap.get(decision.tool ?? "");
+      if (!tool) {
+        lastError = `Unknown read-only planning tool: ${String(decision.tool)}`;
+        await this.emit({ type: "error", category: "protocol", error: lastError });
+        planMessages.push(repairPrompt(lastError, response.content));
+        await this.persist();
+        continue;
+      }
+
+      const input = decision.input ?? {};
+      const description = tool.describe(input);
+      await this.emit({ type: "tool_request", turn, tool: tool.name, input, thought: decision.thought, description });
+      const validation = tool.validate(input);
+      const result = validation ?? await tool.run(input);
+      await this.emit({ type: "tool_result", turn, tool: tool.name, ok: result.ok, output: result.output, errorType: result.errorType, metadata: result.metadata });
+      planMessages.push({
+        role: "tool",
+        content: JSON.stringify({ tool: tool.name, ok: result.ok, output: result.output, errorType: result.errorType, metadata: result.metadata })
+      });
+      if (!result.ok) lastError = result.output;
+      await this.persist();
+    }
+
+    throw new Error(`Plan mode reached max turns before producing a final plan.${lastError ? ` Last error: ${lastError}` : ""}`);
   }
 
   async approvePlan(id: string): Promise<PlanRecord> {

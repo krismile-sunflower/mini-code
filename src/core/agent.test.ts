@@ -295,6 +295,75 @@ test("AgentSession uses fallback read instead of protocol error after repeated f
   }
 });
 
+test("AgentSession createPlan uses plan model and read-only tools", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-readonly-"));
+  await writeFile(path.join(dir, "README.md"), "hello plan\n", "utf8");
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ body: { model: string; messages: Array<{ role: string; content: string }> } }> = [];
+  const responses = [
+    '{"action":"tool","tool":"read_file","input":{"path":"README.md"},"thought":"Inspect project context before planning."}',
+    '{"action":"final","answer":"Goal:\\nPlan the requested change.\\n\\nRelevant files:\\n- README.md\\n\\nOrdered steps:\\n- Inspect README.md\\n- Implement the change\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- None known\\n\\nOpen questions:\\n- None"}'
+  ];
+  globalThis.fetch = async (_url, init) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return jsonResponse({ choices: [{ message: { content: responses.shift() } }] });
+  };
+  const events: AgentEvent[] = [];
+  try {
+    const session = await AgentSession.create(config(dir, { planModel: "planner-model" }), (event) => events.push(event), async () => "allow_once");
+    const plan = await session.createPlan("plan README update");
+    assert.equal(plan.model, "planner-model");
+    assert.ok(plan.files.some((file) => /README\.md/.test(file)));
+    assert.ok(events.some((event) => event.type === "tool_request" && event.tool === "read_file"));
+    assert.ok(events.some((event) => event.type === "tool_result" && event.tool === "read_file" && event.ok));
+    assert.ok(calls.every((call) => call.body.model === "planner-model"));
+    const system = calls[0]?.body.messages[0]?.content ?? "";
+    assert.match(system, /read-only plan mode/);
+    assert.doesNotMatch(system, /apply_patch \[risk=write\]/);
+    assert.doesNotMatch(system, /run_command/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession read-only tools policy removes write and shell tools", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-readonly-policy-"));
+  try {
+    const session = await AgentSession.create(config(dir, { toolsPolicy: "read_only" }), () => undefined, async () => "allow_once");
+    const tools = session.describeTools();
+    assert.match(tools, /read_file/);
+    assert.doesNotMatch(tools, /apply_patch/);
+    assert.doesNotMatch(tools, /run_command/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession createPlan does not execute write tools", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-no-write-"));
+  const file = path.join(dir, "note.txt");
+  await writeFile(file, "old\n", "utf8");
+  const originalFetch = globalThis.fetch;
+  const responses = [
+    '{"action":"tool","tool":"apply_patch","input":{"patch":"--- a/note.txt\\n+++ b/note.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n"}}',
+    '{"action":"final","answer":"Goal:\\nPlan only.\\n\\nRelevant files:\\n- note.txt\\n\\nOrdered steps:\\n- Update note.txt after approval\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- Requires write approval\\n\\nOpen questions:\\n- None"}'
+  ];
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: responses.shift() } }] });
+  const events: AgentEvent[] = [];
+  try {
+    const session = await AgentSession.create(config(dir), (event) => events.push(event), async () => "allow_once");
+    const plan = await session.createPlan("plan note update");
+    assert.match(plan.answer, /Plan only/);
+    assert.equal(await readFile(file, "utf8"), "old\n");
+    assert.ok(events.some((event) => event.type === "error" && event.category === "parse" && /Unknown tool: apply_patch/.test(event.error)));
+    assert.equal(events.some((event) => event.type === "tool_request" && event.tool === "apply_patch"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function fakeTool(name: string): ToolDefinition {
   return {
     name,

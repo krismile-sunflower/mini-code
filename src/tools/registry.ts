@@ -94,6 +94,49 @@ function withMetadata(result: ToolResult, metadata: ToolMetadata): ToolResult {
   return { ...result, metadata: { ...metadata, ...result.metadata } };
 }
 
+function splitLines(value: string): string[] {
+  return value.length === 0 ? [] : value.replace(/\n$/, "").split("\n");
+}
+
+function firstChangedLine(oldText: string, newText: string): number {
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  let index = 0;
+  while (index < oldLines.length && index < newLines.length && oldLines[index] === newLines[index]) index += 1;
+  return index + 1;
+}
+
+function displayDiff(filePath: string, oldText: string, newText: string): string {
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix += 1;
+
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  const context = 3;
+  const start = Math.max(0, prefix - context);
+  const oldChangeEnd = oldLines.length - suffix;
+  const newChangeEnd = newLines.length - suffix;
+  const oldEnd = Math.min(oldLines.length, oldLines.length - suffix + context);
+  const newEnd = Math.min(newLines.length, newLines.length - suffix + context);
+  const lines = [`--- a/${filePath}`, `+++ b/${filePath}`, `@@ -${start + 1},${oldEnd - start} +${start + 1},${newEnd - start} @@`];
+
+  for (const line of oldLines.slice(start, prefix)) lines.push(` ${line}`);
+  for (const line of oldLines.slice(prefix, oldChangeEnd)) lines.push(`-${line}`);
+  for (const line of newLines.slice(prefix, newChangeEnd)) lines.push(`+${line}`);
+  for (const line of oldLines.slice(oldChangeEnd, oldEnd)) lines.push(` ${line}`);
+
+  return lines.join("\n");
+}
+
 async function walkTree(root: string, relativeRoot: string, maxDepth: number, currentDepth = 0): Promise<string[]> {
   if (currentDepth > maxDepth) return [];
   const entries = await fs.readdir(root, { withFileTypes: true });
@@ -324,6 +367,7 @@ export function createTools(cwd: string, maxOutputChars: number, allowDangerousC
       },
       async run(input) {
         const filePath = resolveInside(cwd, requireString(input, "path"));
+        const relativePath = path.relative(cwd, filePath);
         const oldText = requireString(input, "oldText");
         const newText = requireString(input, "newText");
         const text = await fs.readFile(filePath, "utf8");
@@ -332,8 +376,18 @@ export function createTools(cwd: string, maxOutputChars: number, allowDangerousC
         if (text.indexOf(oldText, first + oldText.length) !== -1) {
           return { ok: false, output: "oldText appears more than once; make it more specific." };
         }
-        await fs.writeFile(filePath, text.replace(oldText, newText), "utf8");
-        return { ok: true, output: `Updated ${path.relative(cwd, filePath)}`, metadata: { path: path.relative(cwd, filePath) } };
+        const nextText = text.replace(oldText, newText);
+        await fs.writeFile(filePath, nextText, "utf8");
+        return {
+          ok: true,
+          output: `Updated ${relativePath}`,
+          metadata: {
+            path: relativePath,
+            touchedPaths: [relativePath],
+            diff: displayDiff(relativePath, text, nextText),
+            firstChangedLine: firstChangedLine(text, nextText)
+          }
+        };
       }
     },
     {
@@ -352,10 +406,21 @@ export function createTools(cwd: string, maxOutputChars: number, allowDangerousC
       },
       async run(input) {
         const filePath = resolveInside(cwd, requireString(input, "path"));
+        const relativePath = path.relative(cwd, filePath);
         const content = typeof input.content === "string" ? input.content : "";
+        const oldContent = await fs.readFile(filePath, "utf8").catch(() => "");
         await fs.mkdir(path.dirname(filePath), { recursive: true });
         await fs.writeFile(filePath, content, "utf8");
-        return { ok: true, output: `Wrote ${path.relative(cwd, filePath)}`, metadata: { path: path.relative(cwd, filePath) } };
+        return {
+          ok: true,
+          output: `Wrote ${relativePath}`,
+          metadata: {
+            path: relativePath,
+            touchedPaths: [relativePath],
+            diff: displayDiff(relativePath, oldContent, content),
+            firstChangedLine: firstChangedLine(oldContent, content)
+          }
+        };
       }
     },
     {
@@ -374,10 +439,20 @@ export function createTools(cwd: string, maxOutputChars: number, allowDangerousC
       },
       async run(input) {
         const filePath = resolveInside(cwd, requireString(input, "path"));
+        const relativePath = path.relative(cwd, filePath);
         const content = typeof input.content === "string" ? input.content : "";
         await fs.mkdir(path.dirname(filePath), { recursive: true });
         await fs.writeFile(filePath, content, { encoding: "utf8", flag: "wx" });
-        return { ok: true, output: `Created ${path.relative(cwd, filePath)}`, metadata: { path: path.relative(cwd, filePath) } };
+        return {
+          ok: true,
+          output: `Created ${relativePath}`,
+          metadata: {
+            path: relativePath,
+            touchedPaths: [relativePath],
+            diff: displayDiff(relativePath, "", content),
+            firstChangedLine: 1
+          }
+        };
       }
     },
     {
@@ -395,8 +470,9 @@ export function createTools(cwd: string, maxOutputChars: number, allowDangerousC
         return validateInput("apply_patch", input, rulesFor("apply_patch"));
       },
       async run(input) {
-        const output = await applyUnifiedPatch(cwd, requireString(input, "patch"));
-        return { ok: true, output, metadata: { touchedPaths: output.split(/\r?\n/).map((line) => line.replace(/^(?:Updated|Created|Deleted)\s+/, "")).filter(Boolean) } };
+        const patch = requireString(input, "patch");
+        const output = await applyUnifiedPatch(cwd, patch);
+        return { ok: true, output, metadata: { touchedPaths: output.split(/\r?\n/).map((line) => line.replace(/^(?:Updated|Created|Deleted)\s+/, "")).filter(Boolean), patch } };
       }
     },
     {
@@ -414,8 +490,9 @@ export function createTools(cwd: string, maxOutputChars: number, allowDangerousC
         return validateInput("git_apply_check", input, rulesFor("git_apply_check"));
       },
       async run(input) {
-        const output = await checkUnifiedPatch(cwd, requireString(input, "patch"));
-        return { ok: true, output: clip(output, maxOutputChars), metadata: { touchedPaths: output.split(/\r?\n/).slice(1).map((line) => line.replace(/^(?:Updated|Created|Deleted)\s+/, "")).filter(Boolean) } };
+        const patch = requireString(input, "patch");
+        const output = await checkUnifiedPatch(cwd, patch);
+        return { ok: true, output: clip(output, maxOutputChars), metadata: { touchedPaths: output.split(/\r?\n/).slice(1).map((line) => line.replace(/^(?:Updated|Created|Deleted)\s+/, "")).filter(Boolean), patch, checked: true } };
       }
     },
     {

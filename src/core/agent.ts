@@ -1,5 +1,7 @@
 import { maybeCompactMessages } from "./compaction.js";
 import { parseDecision } from "./decision.js";
+import { DenialTracker } from "./denial.js";
+import { loadProjectMemory } from "./memory.js";
 import { fallbackReadFilePath, finalClaimsToolUse, requiresPlan, requiresWorkspaceTool } from "./policy.js";
 import { executePlanRequest, planModeRequest, planRequiredCorrection, planSystemPrompt, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
 import { discoverSkills, renderSkillList, skillInjection } from "./skills.js";
@@ -74,6 +76,12 @@ export class AgentSession {
   private events: AgentEvent[] = [];
   private summary = "";
   private permissionMode: PermissionMode;
+  private abortController: AbortController | null;
+  private readonly denialTracker = new DenialTracker();
+
+  abort(): void {
+    this.abortController?.abort();
+  }
 
   private constructor(
     private readonly config: AgentConfig,
@@ -83,6 +91,7 @@ export class AgentSession {
     private readonly skills: SkillInfo[],
     record: SessionRecord
   ) {
+    this.abortController = null;
     this.tools = new Map(toolList.map((tool) => [tool.name, tool]));
     this.sessionStore = new SessionStore(config.sessionDir);
     this.approvalContext = {
@@ -105,10 +114,11 @@ export class AgentSession {
   static async create(config: AgentConfig, onEvent: AgentEventHandler, onApproval: ApprovalHandler): Promise<AgentSession> {
     const toolList = selectToolsForPolicy(createTools(config.cwd, config.maxToolOutputChars, config.allowDangerousCommands), config.toolsPolicy);
     const skills = await discoverSkills(config.cwd, config.skills, config.enableSkills);
+    const projectMemory = await loadProjectMemory(config.cwd);
     const store = new SessionStore(config.sessionDir);
     await store.ensure();
     const loaded = config.sessionId ? await store.load(config.sessionId) : undefined;
-    const messages = loaded?.messages ?? [{ role: "system", content: systemPrompt(toolList, skills) }];
+    const messages = loaded?.messages ?? [{ role: "system", content: systemPrompt(toolList, skills, projectMemory) }];
     const record =
       loaded ??
       store.createRecord({
@@ -125,6 +135,7 @@ export class AgentSession {
   }
 
   async run(userRequest: string): Promise<string> {
+    this.abortController = new AbortController();
     const task = createTask(userRequest);
     this.record.tasks = [...(this.record.tasks ?? []), task];
     this.messages.push({ role: "user", content: userRequest });
@@ -143,6 +154,16 @@ export class AgentSession {
     let toolRequiredCorrections = 0;
 
     for (let turn = 1; turn <= this.config.maxTurns; turn += 1) {
+      if (this.abortController.signal.aborted) {
+        const msg = "Aborted by user.";
+        task.status = "failed";
+        task.error = msg;
+        completeActiveTodo(task);
+        touchTask(task);
+        await this.emit({ type: "final", answer: msg });
+        await this.persist();
+        return msg;
+      }
       await this.compactIfNeeded();
       const { raw, decision } = await this.nextDecision();
       if (mustPlan && !hasPlan && decision.action !== "plan") {
@@ -348,6 +369,21 @@ export class AgentSession {
         return true;
       }
 
+      // todo_write: intercept to update task todos then emit a plan event
+      if (tool.name === "todo_write" && Array.isArray(input.todos)) {
+        const rawTodos = input.todos as Array<{ id: string; content: string; status: string }>;
+        task.todos = rawTodos.map((t) => ({
+          id: t.id,
+          content: t.content,
+          status: (["pending", "in_progress", "completed"].includes(t.status) ? t.status : "pending") as TaskTodo["status"]
+        }));
+        touchTask(task);
+        await this.emit({ type: "plan", turn, todos: task.todos });
+        const result = await tool.run(input);
+        await this.recordToolResult(task, turn, tool.name, result.ok, result.output, result.errorType, result.metadata);
+        return true;
+      }
+
       const requirement = tool.requiresApproval(input, this.approvalContext);
       if (requirement.required) {
         task.status = "waiting_permission";
@@ -360,6 +396,7 @@ export class AgentSession {
           return true;
         }
         const approvalId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const denialKey = requirement.approvalKey ?? requirement.allowAlwaysKey ?? `${tool.name}:${description}`;
         const decisionResult = await this.onApproval({
           id: approvalId,
           tool: tool.name,
@@ -372,10 +409,16 @@ export class AgentSession {
         task.approvals.push(event);
         await this.emit(event);
         if (decisionResult === "deny") {
+          this.denialTracker.record(denialKey);
           await this.emit({ type: "error", category: "permission", error: `User denied permission: ${requirement.reason}` });
           await this.recordToolResult(task, turn, tool.name, false, `User denied permission: ${requirement.reason}`, "permission_denied", approvalMetadata(requirement));
+          if (this.denialTracker.shouldInjectCorrection(denialKey)) {
+            this.messages.push({ role: "user", content: this.denialTracker.correctionMessage(denialKey) });
+            await this.persist();
+          }
           return true;
         }
+        this.denialTracker.reset(denialKey);
         this.rememberApproval(tool.name, input, requirement.allowAlwaysKey, decisionResult);
       }
 
@@ -390,6 +433,80 @@ export class AgentSession {
     this.summary = compacted.summary;
     await this.emit({ type: "compaction", summary: this.summary });
     await this.persist();
+  }
+
+  /**
+   * Generate a CLAUDE.md project memory file by inspecting the repository
+   * structure and key files, then writing the result to {cwd}/CLAUDE.md.
+   * Mirrors Claude Code's /init command.
+   */
+  async initProjectMemory(): Promise<string> {
+    const { writeFile } = await import("node:fs/promises");
+    const path = await import("node:path");
+    const readOnlyTools = Array.from(this.tools.values()).filter((tool) => tool.risk === "read");
+    const readOnlyToolMap = new Map(readOnlyTools.map((tool) => [tool.name, tool]));
+
+    const initPrompt = `You are generating a CLAUDE.md project memory file for this repository.
+
+Your task:
+1. Use read_tree to get the project layout
+2. Use read_many_files to read key config files (package.json, tsconfig.json, README.md if they exist)
+3. Use search to find entry points and important patterns if needed
+4. Return a final JSON answer with a markdown document that can serve as CLAUDE.md
+
+The CLAUDE.md should cover:
+- Project purpose and tech stack
+- Key directories and what they contain
+- Build/test/run commands
+- Important conventions and patterns
+- Files that should not be modified
+
+Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
+
+    const initMessages: Message[] = [
+      { role: "system", content: `You are a read-only code analyser. Only use read tools. Return exactly one JSON object per turn.\n\nAvailable tools:\n${Array.from(readOnlyTools).map((t) => `- ${t.name}: ${t.description}`).join("\n")}` },
+      { role: "user", content: initPrompt }
+    ];
+
+    for (let turn = 1; turn <= 10; turn += 1) {
+      const response = await complete({
+        provider: this.config.provider,
+        baseUrl: this.config.baseUrl,
+        apiKey: this.config.apiKey,
+        model: this.config.model,
+        messages: initMessages,
+        signal: this.abortController?.signal ?? undefined,
+        onDelta: (text) => { void this.onEvent({ type: "model_stream_delta", text }); }
+      });
+      initMessages.push({ role: "assistant", content: response.content });
+      await this.onEvent({ type: "model_response", raw: response.raw, content: response.content, streamEvents: response.streamEvents });
+
+      let decision: AgentDecision;
+      try {
+        decision = parseDecision(response.content, readOnlyToolMap);
+      } catch {
+        break;
+      }
+
+      if (decision.action === "final") {
+        const claudeMdContent = decision.answer ?? "";
+        const outPath = path.default.join(this.config.cwd, "CLAUDE.md");
+        await writeFile(outPath, claudeMdContent, "utf8");
+        return outPath;
+      }
+
+      if (decision.action === "tool") {
+        const tool = readOnlyToolMap.get(decision.tool ?? "");
+        if (!tool) break;
+        const input = decision.input ?? {};
+        await this.onEvent({ type: "tool_request", turn, tool: tool.name, input, thought: decision.thought, description: tool.describe(input) });
+        const result = await tool.run(input);
+        await this.onEvent({ type: "tool_result", turn, tool: tool.name, ok: result.ok, output: result.output });
+        initMessages.push({ role: "tool", content: JSON.stringify({ tool: tool.name, ok: result.ok, output: result.output }) });
+      }
+    }
+
+    throw new Error("Could not generate CLAUDE.md — model did not produce a final answer.");
   }
 
   getSummary(): string {
@@ -470,13 +587,21 @@ export class AgentSession {
   }
 
   private async callModel(): Promise<string> {
-    const response = await complete({
-      provider: this.config.provider,
-      baseUrl: this.config.baseUrl,
-      apiKey: this.config.apiKey,
-      model: this.config.model,
-      messages: this.messages
-    });
+    let response;
+    try {
+      response = await complete({
+        provider: this.config.provider,
+        baseUrl: this.config.baseUrl,
+        apiKey: this.config.apiKey,
+        model: this.config.model,
+        messages: this.messages,
+        signal: this.abortController?.signal ?? undefined,
+        onDelta: (text) => { void this.onEvent({ type: "model_stream_delta", text }); }
+      });
+    } catch (error) {
+      if (this.abortController?.signal.aborted) return "";
+      throw error;
+    }
     this.messages.push({ role: "assistant", content: response.content });
     await this.emit({ type: "model_response", raw: response.raw, content: response.content, provider: response.provider, model: response.model, streamEvents: response.streamEvents });
     return response.content;

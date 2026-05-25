@@ -183,6 +183,7 @@ export interface ToolDefinition {
 
 export type AgentEvent =
   | { type: "model_response"; raw: string; content?: string; provider?: LlmProvider; model?: string; streamEvents?: ModelStreamEvent[] }
+  | { type: "model_stream_delta"; text: string }
   | { type: "plan"; turn: number; todos: TaskTodo[] }
   | { type: "tool_request"; turn: number; tool: string; input: Record<string, unknown>; thought?: string; description: string }
   | { type: "permission_request"; id: string; tool: string; input: Record<string, unknown>; description: string; requirement: ApprovalRequirement }

@@ -126,6 +126,22 @@ export function buildConfig(args: CliArgs): AgentConfig {
   };
 }
 
+export function collectConfigWarnings(cwd: string): string[] {
+  const loadedEnv = loadConfigEnvDetailed(cwd);
+  const env = loadedEnv.values;
+  const warnings: string[] = [];
+  if (env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY) {
+    warnings.push(
+      [
+        "Auth conflict: Both ANTHROPIC_API_KEY and OPENAI_API_KEY are set. This may lead to unexpected behavior.",
+        "  · Use --provider anthropic or --provider openai to explicitly select one.",
+        "  · Or unset the unused API key environment variable.",
+      ].join("\n")
+    );
+  }
+  return warnings;
+}
+
 function splitList(value: string | undefined): string[] {
   return value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [];
 }

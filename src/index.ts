@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import React from "react";
 import { render } from "ink";
-import { buildConfig, readArgs } from "./cli/config.js";
+import { buildConfig, collectConfigWarnings, readArgs } from "./cli/config.js";
 import { runPiCli } from "./cli/piWrapper.js";
 import { runPlainCli } from "./cli/plainCli.js";
 import { SessionStore } from "./storage/sessionStore.js";
+import { discoverSkills } from "./core/skills.js";
 import { App } from "./ui/App.js";
 
 async function main(): Promise<void> {
@@ -35,7 +36,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  render(React.createElement(App, { config }));
+  const warnings = collectConfigWarnings(config.cwd);
+  const skills = await discoverSkills(config.cwd, config.skills, config.enableSkills);
+  render(React.createElement(App, { config, warnings, skills }));
 }
 
 main().catch((error: unknown) => {

@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { AgentSession } from "../core/agent.js";
+import { loadProjectMemory } from "../core/memory.js";
 import { SessionStore } from "../storage/sessionStore.js";
 import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval } from "../core/types.js";
 import type { CliArgs } from "./config.js";
@@ -38,7 +39,22 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       continue;
     }
     if (request === "/help") {
-      output.write("/plan <request> /execute <plan-id> /skills /skill:<name> <args> /sessions /new /resume <id> /rename <title> /export-session <path> /compact /summary /status /tools /permissions /exit\n");
+      output.write("/plan <request> /execute <plan-id> /memory /skills /skill:<name> <args> /sessions /new /resume <id> /rename <title> /export-session <path> /compact /summary /status /tools /permissions /exit\n");
+      continue;
+    }
+    if (request === "/memory") {
+      const mem = await loadProjectMemory(currentConfig.cwd);
+      output.write(mem ? `${mem}\n` : "No CLAUDE.md files found.\n");
+      continue;
+    }
+    if (request === "/init") {
+      output.write("Analysing repository to generate CLAUDE.md...\n");
+      try {
+        const outPath = await session.initProjectMemory();
+        output.write(`CLAUDE.md written to ${outPath}\nRestart or /new to pick it up in the next session.\n`);
+      } catch (error) {
+        output.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
       continue;
     }
     if (request === "/status") {
@@ -131,7 +147,15 @@ async function printSessions(sessionDir: string): Promise<void> {
 }
 
 function renderEvent(event: AgentEvent): void {
-  if (event.type === "model_response") return;
+  if (event.type === "model_stream_delta") {
+    process.stdout.write(event.text);
+    return;
+  }
+  if (event.type === "model_response") {
+    // Ensure a newline after streaming output
+    if (process.stdout.isTTY) process.stdout.write("\n");
+    return;
+  }
   if (event.type === "plan") {
     output.write(`\nPlan\n`);
     for (const todo of event.todos) {

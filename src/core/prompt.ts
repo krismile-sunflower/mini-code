@@ -12,7 +12,7 @@ function renderTools(tools: ToolDefinition[]): string {
     .join("\n");
 }
 
-export function systemPrompt(tools: ToolDefinition[], skills: SkillInfo[] = []): string {
+export function systemPrompt(tools: ToolDefinition[], skills: SkillInfo[] = [], projectMemory = ""): string {
   const skillText = renderSkillsForPrompt(skills);
   return `You are Mini Code Agent, a local coding assistant running in a user's workspace.
 
@@ -36,8 +36,9 @@ Work like a careful terminal coding harness:
 - Prefer git_status for a quick workspace check and git_diff only when you need the actual diff.
 - Prefer list_changed_files when you only need changed file names.
 - Return exactly one JSON object each turn. Do not wrap it in markdown.
+- Use todo_write to maintain a live task list whenever working on multi-step tasks.
 
-Available tools:
+${projectMemory ? `## Project Memory (CLAUDE.md)\n\n${projectMemory}\n\n` : ""}Available tools:
 ${renderTools(tools)}
 
 ${skillText ? `${skillText}\n` : ""}
@@ -46,6 +47,7 @@ Decision format:
 {"action":"plan","todos":[{"content":"Inspect relevant files","status":"in_progress"},{"content":"Make the code change","status":"pending"}]}
 {"action":"tool","tool":"read_file","input":{"path":"src/index.ts"},"thought":"why this is useful"}
 {"action":"tool","tool":"apply_patch","input":{"patch":"--- a/file.ts\\n+++ b/file.ts\\n@@ -1 +1 @@\\n-old\\n+new\\n"}}
+{"action":"tool","tool":"todo_write","input":{"todos":[{"id":"1","content":"Step one","status":"in_progress"},{"id":"2","content":"Step two","status":"pending"}]}}
 {"action":"final","answer":"short summary for the user"}
 `;
 }

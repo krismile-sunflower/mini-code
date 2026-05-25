@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { AgentConfig, AgentEvent, ApprovalDecision, ModelStreamEvent, PendingApproval, PermissionMode, TaskTodo, ToolErrorType, ToolMetadata } from "../core/types.js";
+import type { AgentConfig, AgentEvent, ApprovalDecision, ModelStreamEvent, PendingApproval, PermissionMode, SkillInfo, TaskTodo, ToolErrorType, ToolMetadata } from "../core/types.js";
 
 export type TimelineKind = "user" | "assistant_text" | "plan" | "thinking" | "tool_request" | "permission" | "code_change" | "tool_result" | "final" | "error" | "session" | "compact";
 export type TimelineSeverity = "muted" | "neutral" | "active" | "success" | "warning" | "danger";
@@ -28,7 +28,7 @@ export interface StatusModel {
   planModel: string;
   session: string;
   turn: number;
-  state: "idle" | "running" | "permission";
+  state: "idle" | "running" | "aborting" | "permission";
   taskStatus?: string;
   permissionMode: PermissionMode;
   messages: number;
@@ -70,6 +70,7 @@ export function statusModel(input: {
   messageCount: number;
   hasSummary: boolean;
   permissionMode?: PermissionMode;
+  aborting?: boolean;
 }): StatusModel {
   return {
     title: "Mini Code Agent",
@@ -79,7 +80,7 @@ export function statusModel(input: {
     planModel: input.config.planModel,
     session: truncateMiddle(input.sessionId, 22),
     turn: input.turn,
-    state: input.approval ? "permission" : input.busy ? "running" : "idle",
+    state: input.approval ? "permission" : input.aborting ? "aborting" : input.busy ? "running" : "idle",
     permissionMode: input.permissionMode ?? input.config.permissionMode,
     messages: input.messageCount,
     summary: input.hasSummary
@@ -101,7 +102,7 @@ export function headerFields(status: StatusModel): HeaderField[] {
 }
 
 export const commandGroups: CommandGroup[] = [
-  { title: "Session", commands: ["/help", "/status", "/sessions", "/new", "/resume <id>", "/rename <title>", "/export-session <path>"] },
+  { title: "Session", commands: ["/help", "/status", "/memory", "/init", "/sessions", "/new", "/resume <id>", "/rename <title>", "/export-session <path>"] },
   { title: "Work", commands: ["/plan <request>", "/execute <plan-id>", "/tools", "/permissions", "/skills", "/skill:<name> <args>"] },
   { title: "View", commands: ["/details", "/expand", "/history", "/clear"] },
   { title: "Context", commands: ["/compact", "/summary"] },
@@ -138,10 +139,12 @@ export function permissionModeColor(mode: PermissionMode): string {
 export function stateColor(state: StatusModel["state"]): string {
   if (state === "permission") return "yellow";
   if (state === "running") return "blue";
+  if (state === "aborting") return "red";
   return "gray";
 }
 
 export function eventToTimelineItems(event: AgentEvent): TimelineItem[] {
+  if (event.type === "model_stream_delta") return [];
   if (event.type === "model_response") return piLikeModelEventsToTimeline(event.streamEvents ?? []);
   if (event.type === "plan") return [{ kind: "plan", turn: event.turn, todos: event.todos }];
   if (event.type === "error" && event.category === "protocol" && /Asking the model/i.test(event.error)) return [];
@@ -456,4 +459,80 @@ function dedupeRows(rows: Array<{ label: string; value: string }>): Array<{ labe
     seen.add(key);
     return row.value !== "";
   });
+}
+
+// ── Welcome screen & command completion ──────────────────────────────────────
+
+export const asciiArt: string[] = [
+  "  ╭───────────╮  ",
+  "  │  ◉     ◉  │  ",
+  "  │    ─────  │  ",
+  "  ╰─────┬─────╯  ",
+  "   ╔════╧════╗   ",
+  "   ║         ║   ",
+  "   ╚═════════╝   ",
+];
+
+export const welcomeTips = {
+  gettingStarted: {
+    title: "Tips for getting started",
+    items: [
+      "Ask a question or describe a coding task",
+      "Run /help to see all available commands",
+      "Use /skills to list available project skills",
+      "Press Shift+Tab to cycle permission mode",
+      "Use /plan <request> to plan before executing",
+    ],
+  },
+  whatsNew: {
+    title: "What's new",
+    items: [
+      "Check README.md for the latest updates",
+    ],
+  },
+};
+
+export interface CommandEntry {
+  command: string;
+  description: string;
+}
+
+export const commandDescriptions: Record<string, string> = {
+  "/help": "Show all available commands",
+  "/status": "Show session status and configuration",
+  "/memory": "Show loaded CLAUDE.md project memory",
+  "/init": "Generate CLAUDE.md by analysing this repository",
+  "/sessions": "List all saved sessions",
+  "/new": "Start a new session",
+  "/resume": "Resume a previous session by ID",
+  "/rename": "Rename the current session",
+  "/export-session": "Export session history to a file",
+  "/plan": "Create a step-by-step plan before coding",
+  "/execute": "Execute a previously created plan",
+  "/tools": "List all available tools",
+  "/permissions": "Show current permission settings",
+  "/skills": "List discovered project skills",
+  "/skill:": "Run a named skill with optional args",
+  "/details": "Toggle the detailed view panel on/off",
+  "/expand": "Toggle expanded diff output",
+  "/history": "Toggle extended history view",
+  "/clear": "Clear the conversation display",
+  "/compact": "Summarize and compact context history",
+  "/summary": "Show current context summary",
+  "/exit": "Exit Mini Code Agent",
+};
+
+export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[]): CommandEntry[] {
+  const query = prefix.toLowerCase();
+  const cmdEntries: CommandEntry[] = Object.entries(commandDescriptions).map(([command, description]) => ({
+    command,
+    description,
+  }));
+  const skillEntries: CommandEntry[] = skills.map((skill) => ({
+    command: `/skill:${skill.name}`,
+    description: skill.description,
+  }));
+  const all = [...cmdEntries, ...skillEntries];
+  if (query === "/") return all.slice(0, 12);
+  return all.filter((entry) => entry.command.startsWith(query)).slice(0, 12);
 }

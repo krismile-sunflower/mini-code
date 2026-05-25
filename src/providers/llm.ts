@@ -1,4 +1,4 @@
-import type { LlmProvider, Message, ModelResponse } from "../core/types.js";
+import type { LlmProvider, Message, ModelResponse, ModelStreamEvent } from "../core/types.js";
 
 export interface ChatOptions {
   provider: LlmProvider;
@@ -7,27 +7,10 @@ export interface ChatOptions {
   model: string;
   messages: Message[];
   temperature?: number;
-}
-
-interface OpenAIChatResponse {
-  choices?: Array<{
-    message?: {
-      content?: string;
-    };
-  }>;
-  error?: {
-    message?: string;
-  };
-}
-
-interface AnthropicResponse {
-  content?: Array<{
-    type: string;
-    text?: string;
-  }>;
-  error?: {
-    message?: string;
-  };
+  /** AbortSignal to cancel the in-flight request */
+  signal?: AbortSignal;
+  /** Called for each text token as it streams in */
+  onDelta?: (text: string) => void;
 }
 
 export async function complete(options: ChatOptions): Promise<ModelResponse> {
@@ -48,27 +31,59 @@ async function openAIComplete(options: ChatOptions): Promise<ModelResponse> {
       "content-type": "application/json",
       authorization: `Bearer ${options.apiKey}`
     },
+    signal: options.signal,
     body: JSON.stringify({
       model: options.model,
       messages,
-      temperature: options.temperature ?? 0.2
+      temperature: options.temperature ?? 0.2,
+      stream: true
     })
   });
 
-  const body = (await response.json().catch(() => ({}))) as OpenAIChatResponse;
   if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: { message?: string } };
     throw new Error(body.error?.message ?? `OpenAI request failed: ${response.status}`);
   }
+  if (!response.body) throw new Error("OpenAI response body is empty.");
 
-  const content = body.choices?.[0]?.message?.content;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  const streamEvents: ModelStreamEvent[] = [];
+
+  try {
+    outer: while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (options.signal?.aborted) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") break outer;
+        try {
+          const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }> };
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) {
+            content += delta;
+            streamEvents.push({ type: "text_delta", text: delta });
+            options.onDelta?.(delta);
+          }
+        } catch {
+          // ignore malformed SSE lines
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
   if (!content) throw new Error("OpenAI response did not include message content.");
-  return {
-    provider: options.provider,
-    model: options.model,
-    raw: content,
-    content,
-    streamEvents: []
-  };
+  return { provider: options.provider, model: options.model, raw: content, content, streamEvents };
 }
 
 async function anthropicComplete(options: ChatOptions): Promise<ModelResponse> {
@@ -81,29 +96,68 @@ async function anthropicComplete(options: ChatOptions): Promise<ModelResponse> {
       "x-api-key": options.apiKey,
       "anthropic-version": "2023-06-01"
     },
+    signal: options.signal,
     body: JSON.stringify({
       model: options.model,
-      max_tokens: 4096,
+      max_tokens: 8096,
       temperature: options.temperature ?? 0.2,
       system: system || undefined,
-      messages
+      messages,
+      stream: true
     })
   });
 
-  const body = (await response.json().catch(() => ({}))) as AnthropicResponse;
   if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: { message?: string } };
     throw new Error(body.error?.message ?? `Anthropic request failed: ${response.status}`);
   }
+  if (!response.body) throw new Error("Anthropic response body is empty.");
 
-  const content = body.content?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  const streamEvents: ModelStreamEvent[] = [];
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (options.signal?.aborted) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        try {
+          const parsed = JSON.parse(data) as {
+            type?: string;
+            content_block?: { type?: string };
+            delta?: { type?: string; text?: string; thinking?: string };
+          };
+          if (parsed.type === "content_block_delta") {
+            const delta = parsed.delta;
+            if (delta?.type === "text_delta" && typeof delta.text === "string") {
+              content += delta.text;
+              streamEvents.push({ type: "text_delta", text: delta.text });
+              options.onDelta?.(delta.text);
+            } else if (delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
+              streamEvents.push({ type: "thinking_delta", text: delta.thinking });
+            }
+          }
+        } catch {
+          // ignore malformed SSE lines
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
   if (!content) throw new Error("Anthropic response did not include text content.");
-  return {
-    provider: options.provider,
-    model: options.model,
-    raw: content,
-    content,
-    streamEvents: []
-  };
+  return { provider: options.provider, model: options.model, raw: content, content, streamEvents };
 }
 
 export function toProviderMessages(messages: Message[]): Array<{ role: "system" | "user" | "assistant"; content: string }> {

@@ -1,25 +1,38 @@
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import type { SkillInfo } from "./types.js";
+import type { SkillHelper, SkillInfo, ToolRisk } from "./types.js";
 
-export async function discoverSkills(cwd: string, configuredPaths: string[], enabled: boolean): Promise<SkillInfo[]> {
+export interface SkillDiscoveryOptions {
+  includeGlobal?: boolean;
+  homeDir?: string;
+}
+
+interface SkillRoot {
+  path: string;
+  source: NonNullable<SkillInfo["source"]>;
+  configuredFile?: boolean;
+  priority: number;
+}
+
+export function skillRoots(cwd: string, configuredPaths: string[], options: SkillDiscoveryOptions = {}): string[] {
+  return skillRootEntries(cwd, configuredPaths, options).map((root) => root.path);
+}
+
+export async function discoverSkills(cwd: string, configuredPaths: string[], enabled: boolean, options: SkillDiscoveryOptions = {}): Promise<SkillInfo[]> {
   if (!enabled) return [];
-  const roots = [path.join(cwd, ".mini-code", "skills"), path.join(cwd, ".agents", "skills"), path.join(cwd, ".claude", "skills"), ...configuredPaths.map((item) => path.resolve(cwd, item))];
   const skills: SkillInfo[] = [];
-  const seen = new Set<string>();
-  for (const root of roots) {
+  for (const root of skillRootEntries(cwd, configuredPaths, options)) {
     for (const filePath of await skillFiles(root)) {
-      const skill = await readSkill(filePath);
-      if (!skill || seen.has(skill.name)) continue;
-      seen.add(skill.name);
-      skills.push(skill);
+      const skill = await readSkill(filePath, root);
+      if (skill) skills.push(skill);
     }
   }
-  return skills.sort((a, b) => a.name.localeCompare(b.name));
+  return markDefaultSkills(ensureUniqueIds(skills));
 }
 
 export function renderSkillsForPrompt(skills: SkillInfo[]): string {
-  const visible = skills.filter((skill) => !skill.disableModelInvocation);
+  const visible = defaultSkills(skills).filter((skill) => !skill.disableModelInvocation);
   if (visible.length === 0) return "";
   return [
     "Available skills. Use /skill:name when the user explicitly asks, or load the skill when it clearly matches the task:",
@@ -29,48 +42,164 @@ export function renderSkillsForPrompt(skills: SkillInfo[]): string {
 
 export function renderSkillList(skills: SkillInfo[]): string {
   if (skills.length === 0) return "No skills discovered.";
-  return skills.map((skill) => `${skill.name}\t${skill.description}\t${skill.path}`).join("\n");
+  const defaults = defaultSkills(skills).length;
+  const shadowed = skills.filter((skill) => skill.shadowedBy).length;
+  const roots = new Set(skills.map((skill) => skill.root).filter(Boolean)).size;
+  return [
+    `skills: total=${skills.length} defaults=${defaults} shadowed=${shadowed} roots=${roots}`,
+    "id\tname\tsource\tstatus\tdescription\tpath",
+    ...skills.map((skill) => `${skill.id}\t${skill.name}\t${skill.source ?? "project"}\t${skillStatus(skill)}\t${skill.description}\t${skill.path}`),
+    shadowed > 0 ? "hint: /skill:<name> loads the default skill; /skill:<id> loads an exact skill." : ""
+  ].filter(Boolean).join("\n");
+}
+
+export function renderSkillInspect(skill: SkillInfo, candidates: SkillInfo[] = [skill]): string {
+  if (candidates.length > 1) {
+    return [
+      `matches for: ${skill.name}`,
+      "id\tstatus\tsource\tdescription\tpath",
+      ...candidates.map((item) => `${item.id}\t${skillStatus(item)}\t${item.source ?? "project"}\t${item.description}\t${item.path}`),
+      "",
+      `default: ${candidates.find((item) => !item.shadowedBy)?.id ?? candidates[0]?.id}`
+    ].join("\n");
+  }
+  return [
+    `id: ${skill.id}`,
+    `name: ${skill.name}`,
+    `displayName: ${skill.displayName}`,
+    `source: ${skill.source ?? "project"}`,
+    `status: ${skillStatus(skill)}`,
+    `description: ${skill.description}`,
+    `path: ${skill.path}`,
+    `root: ${skill.root ?? "[unknown]"}`,
+    `relativePath: ${skill.relativePath ?? "[unknown]"}`,
+    `allowedTools: ${skill.allowedTools.join(", ") || "[none declared]"}`,
+    `disableModelInvocation: ${skill.disableModelInvocation ? "true" : "false"}`,
+    `activation.keywords: ${skill.activation?.keywords.join(", ") || "[none]"}`,
+    `activation.fileGlobs: ${skill.activation?.fileGlobs.join(", ") || "[none]"}`,
+    `references: ${skill.references?.join(", ") || "[none]"}`,
+    `helpers: ${skill.helpers?.map((helper) => `${helper.name} (${helper.risk}) ${helper.command}`).join("; ") || "[none]"}`
+  ].join("\n");
 }
 
 export function skillInjection(skill: SkillInfo, args: string): string {
   return [`Use Mini Code skill: ${skill.name}`, skill.description ? `Description: ${skill.description}` : "", args ? `User arguments: ${args}` : "", "Skill content:", skill.content].filter(Boolean).join("\n\n");
 }
 
-async function skillFiles(root: string): Promise<string[]> {
-  const stat = await fs.stat(root).catch(() => undefined);
+export function defaultSkills(skills: SkillInfo[]): SkillInfo[] {
+  return skills.filter((skill) => !skill.shadowedBy);
+}
+
+export function resolveSkill(skills: SkillInfo[], nameOrId: string): { skill?: SkillInfo; candidates: SkillInfo[] } {
+  const normalized = normalizeName(nameOrId);
+  const exact = skills.find((skill) => skill.id === nameOrId || skill.id === normalized);
+  if (exact) return { skill: exact, candidates: [exact] };
+  const candidates = skills.filter((skill) => skill.name === normalized || skill.name.startsWith(normalized));
+  const defaults = candidates.filter((skill) => !skill.shadowedBy);
+  return { skill: defaults[0] ?? candidates[0], candidates };
+}
+
+function skillRootEntries(cwd: string, configuredPaths: string[], options: SkillDiscoveryOptions = {}): SkillRoot[] {
+  const homeDir = options.homeDir ?? os.homedir();
+  const roots: SkillRoot[] = [
+    { path: path.join(cwd, ".mini-code", "skills"), source: "project", priority: 0 },
+    { path: path.join(cwd, ".agents", "skills"), source: "project", priority: 0 },
+    { path: path.join(cwd, ".claude", "skills"), source: "project", priority: 0 }
+  ];
+  if (options.includeGlobal !== false) {
+    roots.push(
+      { path: path.join(homeDir, ".mini-code", "skills"), source: "global", priority: 2 },
+      { path: path.join(homeDir, ".agents", "skills"), source: "global", priority: 2 },
+      { path: path.join(homeDir, ".claude", "skills"), source: "global", priority: 2 },
+      { path: path.join(homeDir, ".codex", "skills"), source: "global", priority: 2 },
+      { path: path.join(homeDir, ".codex", "plugins", "cache"), source: "plugin", priority: 3 },
+      { path: path.join(homeDir, ".cc-switch", "skills"), source: "global", priority: 2 }
+    );
+  }
+  roots.push(...configuredPaths.map((item) => {
+    const resolved = path.resolve(cwd, item);
+    return { path: resolved, source: "config" as const, configuredFile: resolved.endsWith(".md"), priority: 1 };
+  }));
+  const seen = new Set<string>();
+  return roots
+    .map((root) => ({ ...root, path: path.resolve(root.path) }))
+    .filter((root) => {
+      if (seen.has(root.path)) return false;
+      seen.add(root.path);
+      return true;
+    });
+}
+
+async function skillFiles(root: SkillRoot): Promise<string[]> {
+  const stat = await fs.stat(root.path).catch(() => undefined);
   if (!stat) return [];
-  if (stat.isFile() && root.endsWith(".md")) return [root];
+  if (stat.isFile() && root.configuredFile && root.path.endsWith(".md")) return [root.path];
   if (!stat.isDirectory()) return [];
   const files: string[] = [];
-  const entries = await fs.readdir(root, { withFileTypes: true });
+  const entries = await fs.readdir(root.path, { withFileTypes: true });
   for (const entry of entries) {
-    const fullPath = path.join(root, entry.name);
-    if (entry.isDirectory()) {
-      const skillPath = path.join(fullPath, "SKILL.md");
-      if (await exists(skillPath)) files.push(skillPath);
-      files.push(...(await skillFiles(fullPath)));
-    } else if (entry.isFile() && entry.name.endsWith(".md")) {
-      files.push(fullPath);
-    }
+    if (!entry.isDirectory()) continue;
+    const fullPath = path.join(root.path, entry.name);
+    const skillPath = path.join(fullPath, "SKILL.md");
+    if (await exists(skillPath)) files.push(skillPath);
+    files.push(...(await skillFiles({ ...root, path: fullPath })));
   }
   return Array.from(new Set(files));
 }
 
-async function readSkill(filePath: string): Promise<SkillInfo | undefined> {
+async function readSkill(filePath: string, root: SkillRoot): Promise<SkillInfo | undefined> {
   const content = await fs.readFile(filePath, "utf8").catch(() => undefined);
   if (!content) return undefined;
   const { frontmatter, body } = parseFrontmatter(content);
   const inferred = path.basename(path.dirname(filePath)) === "." ? path.basename(filePath, ".md") : path.basename(path.dirname(filePath));
-  const name = frontmatter.name || inferred;
-  const description = frontmatter.description || firstParagraph(body) || "No description";
+  const displayName = frontmatter.name || inferred;
+  const name = normalizeName(displayName);
+  const relativePath = path.relative(root.path, filePath).replaceAll("\\", "/");
   return {
-    name: normalizeName(name),
-    description,
+    id: skillId(root.source, name, relativePath),
+    name,
+    displayName,
+    description: frontmatter.description || firstParagraph(body) || "No description",
     path: filePath,
+    root: root.path,
+    relativePath,
+    priority: root.priority,
     content,
     allowedTools: splitWords(frontmatter["allowed-tools"]),
-    disableModelInvocation: /^(true|1|yes)$/i.test(frontmatter["disable-model-invocation"] ?? "")
+    disableModelInvocation: /^(true|1|yes)$/i.test(frontmatter["disable-model-invocation"] ?? ""),
+    source: root.source,
+    activation: {
+      keywords: splitWords(frontmatter["activation.keywords"]),
+      fileGlobs: splitWords(frontmatter["activation.file_globs"] ?? frontmatter["activation.fileGlobs"])
+    },
+    helpers: parseHelpers(frontmatter),
+    references: splitWords(frontmatter.references)
   };
+}
+
+function markDefaultSkills(skills: SkillInfo[]): SkillInfo[] {
+  const sorted = [...skills].sort((a, b) => a.name.localeCompare(b.name) || (a.priority ?? 99) - (b.priority ?? 99) || a.path.localeCompare(b.path));
+  const grouped = new Map<string, SkillInfo[]>();
+  for (const skill of sorted) grouped.set(skill.name, [...(grouped.get(skill.name) ?? []), skill]);
+  const result: SkillInfo[] = [];
+  for (const group of grouped.values()) {
+    const [selected, ...rest] = group;
+    if (selected) result.push({ ...selected, shadowedBy: undefined });
+    for (const skill of rest) result.push({ ...skill, shadowedBy: selected?.id });
+  }
+  return result.sort((a, b) => a.name.localeCompare(b.name) || skillStatus(a).localeCompare(skillStatus(b)) || a.id.localeCompare(b.id));
+}
+
+function ensureUniqueIds(skills: SkillInfo[]): SkillInfo[] {
+  const sorted = [...skills].sort((a, b) => a.id.localeCompare(b.id) || a.path.localeCompare(b.path));
+  const counts = new Map<string, number>();
+  const ids = new Map<string, string>();
+  for (const skill of sorted) {
+    const count = counts.get(skill.id) ?? 0;
+    counts.set(skill.id, count + 1);
+    ids.set(skill.path, count === 0 ? skill.id : `${skill.id}:${count + 1}`);
+  }
+  return skills.map((skill) => ({ ...skill, id: ids.get(skill.path) ?? skill.id }));
 }
 
 function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
@@ -79,12 +208,39 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, string
   if (end === -1) return { frontmatter: {}, body: content };
   const raw = content.slice(4, end);
   const frontmatter: Record<string, string> = {};
-  for (const line of raw.split(/\r?\n/)) {
+  let section = "";
+  let helperIndex = -1;
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (/^[A-Za-z0-9_-]+:\s*$/.test(line)) {
+      section = line.slice(0, -1);
+      continue;
+    }
+    if (line.startsWith("- ") && section === "helpers") {
+      helperIndex += 1;
+      const rest = line.slice(2);
+      const index = rest.indexOf(":");
+      if (index !== -1) frontmatter[`helpers.${helperIndex}.${rest.slice(0, index).trim()}`] = cleanValue(rest.slice(index + 1));
+      continue;
+    }
     const index = line.indexOf(":");
     if (index === -1) continue;
-    frontmatter[line.slice(0, index).trim()] = line.slice(index + 1).trim().replace(/^['"]|['"]$/g, "");
+    const key = line.slice(0, index).trim();
+    const value = cleanValue(line.slice(index + 1));
+    if (section === "activation") frontmatter[`activation.${key}`] = value;
+    else if (section === "helpers" && helperIndex >= 0) frontmatter[`helpers.${helperIndex}.${key}`] = value;
+    else frontmatter[key] = value;
   }
   return { frontmatter, body: content.slice(end + 4).trim() };
+}
+
+function cleanValue(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    return trimmed.slice(1, -1).split(",").map((item) => cleanValue(item)).join(" ");
+  }
+  return trimmed.replace(/^['"]|['"]$/g, "");
 }
 
 function firstParagraph(body: string): string {
@@ -97,6 +253,48 @@ function normalizeName(value: string): string {
 
 function splitWords(value: string | undefined): string[] {
   return value?.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean) ?? [];
+}
+
+function parseHelpers(frontmatter: Record<string, string>): SkillHelper[] {
+  const helpers: SkillHelper[] = [];
+  const indexes = new Set<number>();
+  for (const key of Object.keys(frontmatter)) {
+    const match = /^helpers\.(\d+)\./.exec(key);
+    if (match) indexes.add(Number(match[1]));
+  }
+  for (const index of Array.from(indexes).sort((a, b) => a - b)) {
+    const type = frontmatter[`helpers.${index}.type`];
+    const name = frontmatter[`helpers.${index}.name`];
+    const command = frontmatter[`helpers.${index}.command`];
+    const risk = parseRisk(frontmatter[`helpers.${index}.risk`]);
+    if (type === "command" && name && command) helpers.push({ type, name: normalizeName(name), command, risk });
+  }
+  return helpers;
+}
+
+function parseRisk(value: string | undefined): ToolRisk {
+  if (value === "read" || value === "write" || value === "shell" || value === "dangerous") return value;
+  return "shell";
+}
+
+function skillStatus(skill: SkillInfo): "disabled" | "shadowed" | "default" {
+  if (skill.disableModelInvocation) return "disabled";
+  if (skill.shadowedBy) return "shadowed";
+  return "default";
+}
+
+function skillId(source: NonNullable<SkillInfo["source"]>, name: string, relativePath: string): string {
+  const hint = relativePath
+    .replace(/\/SKILL\.md$/i, "")
+    .replace(/\.md$/i, "")
+    .split("/")
+    .filter(Boolean)
+    .slice(-4)
+    .map(normalizeName)
+    .filter(Boolean)
+    .join("-");
+  const suffix = hint && hint !== name ? `:${hint}` : "";
+  return `${source}:${name}${suffix}`;
 }
 
 async function exists(filePath: string): Promise<boolean> {

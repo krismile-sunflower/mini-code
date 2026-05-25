@@ -6,10 +6,12 @@ export interface Message {
 }
 
 export type ToolRisk = "read" | "write" | "shell" | "dangerous";
+export type CapabilityKind = "builtin_tool" | "mcp_tool" | "mcp_resource" | "mcp_prompt" | "skill";
 export type PermissionMode = "default" | "accept_edits" | "bypass_permissions" | "risk-based";
 export type ToolsPolicy = "default" | "read_only";
 export type ApprovalDecision = "allow_once" | "deny" | "always_allow";
 export type LlmProvider = "openai" | "anthropic";
+export type ToolProtocol = "json" | "native";
 
 export type ConfigSource = "cli" | "env" | ".env.local" | ".env" | "config" | "default";
 
@@ -24,12 +26,34 @@ export interface ConfigSources {
 }
 
 export interface SkillInfo {
+  id: string;
   name: string;
+  displayName: string;
   description: string;
   path: string;
+  root?: string;
+  relativePath?: string;
+  priority?: number;
+  shadowedBy?: string;
   content: string;
   allowedTools: string[];
   disableModelInvocation: boolean;
+  source?: "project" | "global" | "plugin" | "config";
+  activation?: SkillActivation;
+  helpers?: SkillHelper[];
+  references?: string[];
+}
+
+export interface SkillActivation {
+  keywords: string[];
+  fileGlobs: string[];
+}
+
+export interface SkillHelper {
+  type: "command";
+  name: string;
+  command: string;
+  risk: ToolRisk;
 }
 
 export interface AgentConfig {
@@ -48,6 +72,12 @@ export interface AgentConfig {
   toolsPolicy: ToolsPolicy;
   skills: string[];
   enableSkills: boolean;
+  includeGlobalSkills?: boolean;
+  enableSkillHelpers?: boolean;
+  enableMcp?: boolean;
+  mcpConfigPath?: string;
+  toolProtocol?: ToolProtocol;
+  featureFlags?: string[];
   maxContextMessages: number;
   maxToolOutputChars: number;
   plain: boolean;
@@ -149,6 +179,18 @@ export type ToolErrorType = "validation" | "permission_denied" | "permission_blo
 export type ToolResultStatus = "ok" | "failed" | "denied" | "blocked" | "validation_error";
 export type ToolMetadata = Record<string, string | number | boolean | string[] | undefined>;
 
+export interface CapabilityDescriptor {
+  id: string;
+  kind: CapabilityKind;
+  name: string;
+  namespace?: string;
+  description: string;
+  inputSchema?: unknown;
+  risk: ToolRisk;
+  source: string;
+  tags?: string[];
+}
+
 export interface ApprovalContext {
   cwd: string;
   mode: PermissionMode;
@@ -223,5 +265,6 @@ export interface SessionRecord {
   events: AgentEvent[];
   tasks?: TaskRecord[];
   plans?: PlanRecord[];
+  capabilities?: CapabilityDescriptor[];
   summary: string;
 }

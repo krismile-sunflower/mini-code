@@ -70,6 +70,16 @@ export function readArgs(argv = process.argv.slice(2)): CliArgs {
       index += 1;
     } else if (arg === "--no-skills") {
       config.enableSkills = false;
+    } else if (arg === "--no-skill-helpers") {
+      config.enableSkillHelpers = false;
+    } else if (arg === "--no-mcp") {
+      config.enableMcp = false;
+    } else if (arg === "--mcp-config" && next) {
+      config.mcpConfigPath = next;
+      index += 1;
+    } else if (arg === "--tool-protocol" && next) {
+      config.toolProtocol = parseToolProtocol(next);
+      index += 1;
     } else if (arg === "--legacy") {
       config.legacy = true;
     }
@@ -93,7 +103,10 @@ export function buildConfig(args: CliArgs): AgentConfig {
   const toolsPolicyChoice = select(args.toolsPolicy, env.MINI_CODE_TOOLS_POLICY, stringValue(projectConfig.toolsPolicy));
   const configSkills = Array.isArray(projectConfig.skills) ? projectConfig.skills.filter((item): item is string => typeof item === "string") : [];
   const envSkills = splitList(env.MINI_CODE_SKILLS);
+  const configFeatures = Array.isArray(projectConfig.featureFlags) ? projectConfig.featureFlags.filter((item): item is string => typeof item === "string") : [];
+  const envFeatures = featureFlagsFromEnv(env);
   const enableSkills = args.enableSkills ?? (!truthy(env.MINI_CODE_NO_SKILLS) && !truthy(env.MINI_AGENT_NO_SKILLS) && projectConfig.enableSkills !== false);
+  const enableMcp = args.enableMcp ?? (!truthy(env.MINI_CODE_NO_MCP) && projectConfig.enableMcp !== false);
   const sources: ConfigSources = {
     provider: sourceFor(providerChoice.source, provider ? "default" : "default"),
     model: sourceFor(modelChoice.source, "default"),
@@ -119,6 +132,12 @@ export function buildConfig(args: CliArgs): AgentConfig {
     toolsPolicy: parseToolsPolicy(toolsPolicyChoice.value),
     skills: [...configSkills, ...envSkills, ...(args.skills ?? [])],
     enableSkills,
+    includeGlobalSkills: true,
+    enableSkillHelpers: args.enableSkillHelpers ?? (!truthy(env.MINI_CODE_NO_SKILL_HELPERS) && projectConfig.enableSkillHelpers !== false),
+    enableMcp,
+    mcpConfigPath: args.mcpConfigPath ?? stringValue(projectConfig.mcpConfigPath),
+    toolProtocol: args.toolProtocol ?? parseToolProtocol(stringValue(projectConfig.toolProtocol) ?? "json"),
+    featureFlags: uniqueStrings([...configFeatures, ...envFeatures]),
     maxContextMessages: args.maxContextMessages ?? 40,
     maxToolOutputChars: args.maxToolOutputChars ?? 12_000,
     plain: args.plain ?? false,
@@ -155,6 +174,18 @@ export function collectConfigWarnings(cwd: string): string[] {
 
 function splitList(value: string | undefined): string[] {
   return value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [];
+}
+
+function featureFlagsFromEnv(env: EnvMap): string[] {
+  return Object.entries(env)
+    .filter(([key, value]) => key.startsWith("FEATURE_") && truthy(value))
+    .map(([key]) => key.slice("FEATURE_".length).toLowerCase().replace(/_/g, "-"))
+    .filter(Boolean)
+    .sort();
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean))).sort();
 }
 
 function truthy(value: string | undefined): boolean {
@@ -204,6 +235,11 @@ function parseToolsPolicy(value: string | undefined): ToolsPolicy {
   if (!value || value === "default") return "default";
   if (value === "read_only") return "read_only";
   throw new Error(`Unsupported tools policy: ${value}. Use default or read_only.`);
+}
+
+function parseToolProtocol(value: string): NonNullable<AgentConfig["toolProtocol"]> {
+  if (value === "json" || value === "native") return value;
+  throw new Error(`Unsupported tool protocol: ${value}. Use json or native.`);
 }
 
 function inferProvider(env: EnvMap): LlmProvider {

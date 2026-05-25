@@ -24,6 +24,17 @@ test("buildConfig reads .mini-code config and env aliases", () => {
   assert.equal(config.enableSkills, true);
 });
 
+test("buildConfig collects FEATURE flags from env and config", () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "mini-config-features-"));
+  mkdirSync(path.join(cwd, ".mini-code"), { recursive: true });
+  writeFileSync(path.join(cwd, ".mini-code", "config.json"), JSON.stringify({ featureFlags: ["custom-mode"] }));
+  writeFileSync(path.join(cwd, ".env.local"), "FEATURE_BUDDY=1\nFEATURE_REMOTE_MONITOR=true\nFEATURE_OFF=0\nOPENAI_API_KEY=key\n");
+
+  const config = buildConfig(readArgs(["--cwd", cwd]));
+
+  assert.deepEqual(config.featureFlags, ["buddy", "custom-mode", "remote-monitor"]);
+});
+
 test("readArgs parses mini shell public flags", () => {
   const args = readArgs(["--plan", "fix tests", "--plan-model", "planner", "--skill", "skills/x", "--no-skills", "--execute-plan", "plan-1", "--pi-pass-through", "--", "--help"]);
 

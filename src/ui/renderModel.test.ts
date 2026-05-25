@@ -2,28 +2,40 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   approvalRows,
+  approvalCardRows,
   blockedApprovalText,
+  claudeActivityLines,
+  claudeDisplay,
   codeChangeFromToolRequest,
   codeChangeFromToolResult,
   commandGroups,
   detailForItem,
   diffSummary,
   emptyStates,
+  estimateRunUsage,
+  estimateTextTokens,
   eventToTimelineItems,
+  extractDisplayMarkdown,
   headerFields,
   asciiArt,
+  inputStatusModel,
+  markdownPreview,
   nextPermissionMode,
+  normalizeDisplayMarkdown,
   outputPreview,
   piLikeModelEventsToTimeline,
   permissionModeLabel,
   planSummaryRows,
   renderDiffLines,
+  renderCommandHelp,
+  skillPickerRows,
   slashCommands,
   stateColor,
   statusModel,
   timelineLabel,
   timelineMarkdownLines,
   timelineRenderBlocks,
+  tokenizeCodeLine,
   todoLabel,
   toolRequestLabel,
   filterCommandsAndSkills,
@@ -98,6 +110,17 @@ test("approvalRows includes risk, tool, action, and details", () => {
   assert.ok(rows.some((row) => row.label === "scopeType" && row.value === "command prefix"));
   assert.ok(rows.some((row) => row.label === "rememberPolicy" && row.value === "command prefix"));
   assert.ok(rows.some((row) => row.label === "riskReason" && /Low-risk/.test(row.value)));
+});
+
+test("approvalCardRows exposes fixed Claude Code style fields", () => {
+  const rows = approvalCardRows(pendingApproval());
+
+  assert.deepEqual(rows.map((row) => row.label), ["risk", "scope", "reason", "remember", "command", "path"]);
+  assert.equal(rows.find((row) => row.label === "risk")?.value, "shell");
+  assert.equal(rows.find((row) => row.label === "scope")?.value, "npm test");
+  assert.match(rows.find((row) => row.label === "reason")?.value ?? "", /requires approval/);
+  assert.equal(rows.find((row) => row.label === "remember")?.value, "command prefix");
+  assert.equal(rows.find((row) => row.label === "command")?.value, "npm test");
 });
 
 test("blockedApprovalText hides allow actions for blocked approvals", () => {
@@ -177,9 +200,135 @@ test("timeline labels map high-signal states to stable markers and colors", () =
   assert.equal(timelineLabel({ kind: "error", category: "runtime", text: "Boom" }).severity, "danger");
 });
 
+test("claudeDisplay maps conversation roles to Claude Code style rows", () => {
+  const user = claudeDisplay({ kind: "user", text: "当前项目的 package.json 里面有什么" });
+  assert.equal(user.role, "user");
+  assert.equal(user.marker, ">");
+  assert.equal(user.background, "#3a3a3a");
+
+  const final = claudeDisplay({ kind: "final", text: "完成" });
+  assert.equal(final.role, "assistant");
+  assert.equal(final.marker, "●");
+
+  const session = claudeDisplay({ kind: "session", text: "status" });
+  assert.equal(session.role, "system");
+  assert.equal(session.textColor, "gray");
+});
+
+test("claudeActivityLines renders read and thinking activity compactly", () => {
+  const pending = claudeActivityLines([
+    { kind: "thinking", turn: 1, text: "Need to read package metadata." },
+    { kind: "tool_request", turn: 1, tool: "read_file", description: "Read package.json", input: { path: "package.json" } }
+  ], false, { running: true, elapsedSeconds: 7, outputTokens: 15, thoughtTokens: 10 });
+  assert.match(pending.map((line) => line.text).join("\n"), /Reading 1 file\.\.\. \(ctrl\+o to expand\)/);
+  assert.match(pending.map((line) => line.text).join("\n"), /Blanching/);
+  assert.match(pending.map((line) => line.text).join("\n"), /down 15 tokens \| thought for 7s/);
+
+  const completed = claudeActivityLines([
+    { kind: "tool_request", turn: 1, tool: "read_many_files", description: "Read files", input: { paths: ["a.ts", "b.ts"] } },
+    { kind: "tool_result", turn: 1, tool: "read_many_files", ok: true, output: "ok", status: "ok" }
+  ], false);
+  assert.match(completed[0]?.text ?? "", /Read 2 files/);
+
+  const withoutClock = claudeActivityLines([
+    { kind: "thinking", turn: 1, text: "Need package metadata." }
+  ], false);
+  assert.doesNotMatch(withoutClock.map((line) => line.text).join("\n"), /Blanching/);
+  assert.doesNotMatch(withoutClock.map((line) => line.text).join("\n"), /thought for 2s/);
+});
+
+test("claudeActivityLines deduplicates repeated compact activity rows", () => {
+  const lines = claudeActivityLines([
+    { kind: "tool_request", turn: 1, tool: "read_file", description: "Read package.json", input: { path: "package.json" } },
+    { kind: "tool_request", turn: 2, tool: "read_file", description: "Read package.json", input: { path: "package.json" } },
+    { kind: "tool_request", turn: 3, tool: "read_file", description: "Read package.json", input: { path: "package.json" } },
+    { kind: "thinking", turn: 1, text: "Need package metadata." },
+    { kind: "thinking", turn: 2, text: "Still checking package metadata." },
+    { kind: "thinking", turn: 3, text: "Final check." }
+  ], false, { running: true, elapsedSeconds: 24, outputTokens: 0, thoughtTokens: 94 });
+  assert.equal(lines.filter((line) => /Reading 1 file/.test(line.text)).length, 1);
+  assert.equal(lines.filter((line) => /Blanching/.test(line.text)).length, 1);
+  assert.match(lines.map((line) => line.text).join("\n"), /thought for 24s/);
+});
+
+test("estimateRunUsage and inputStatusModel render dynamic footer state", () => {
+  assert.ok(estimateTextTokens("package 文件里面有什么") > 0);
+  const usage = estimateRunUsage([
+    { kind: "user", text: "package 文件里面有什么" },
+    { kind: "user", text: "queued follow up", queued: true },
+    { kind: "thinking", turn: 1, text: "Need package metadata." },
+    { kind: "tool_request", turn: 1, tool: "read_file", description: "Read package.json", input: { path: "package.json" } }
+  ], "Reading result", 4);
+  assert.equal(usage.toolCount, 1);
+  assert.equal(usage.elapsedSeconds, 4);
+  assert.equal(usage.lastActivity, "tool");
+
+  const status = statusModel({
+    config: config(),
+    sessionId: "session",
+    turn: 1,
+    busy: true,
+    approval: undefined,
+    messageCount: 3,
+    hasSummary: false
+  });
+  const footer = inputStatusModel({ status, promptInput: "", usage, hasConversation: true, expanded: false, detailsVisible: false, aborting: false, queueCount: 2 });
+  assert.match(footer.runningLine ?? "", /Using tools/);
+  assert.match(footer.runningLine ?? "", /esc/);
+  assert.match(footer.runningLine ?? "", /queued 2/);
+  assert.doesNotMatch(footer.runningLine ?? "", /openai:test-model/);
+  assert.match(footer.usageLine, /openai:test-model/);
+  assert.match(footer.usageLine, /queued 2/);
+  assert.match(footer.hintLine ?? "", /ctrl\+o to expand/);
+});
+
+test("output previews point users to ctrl+o expansion", () => {
+  const preview = outputPreview(Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"), false);
+  assert.match(preview, /type \/expand or press ctrl\+o/);
+});
+
+test("tokenizeCodeLine highlights JSON-like code without dependencies", () => {
+  const tokens = tokenizeCodeLine('  "name": "mini", "private": true, "count": 2', "json");
+  assert.ok(tokens.some((token) => token.kind === "key" && token.text === '"name"'));
+  assert.ok(tokens.some((token) => token.kind === "string" && token.text === '"mini"'));
+  assert.ok(tokens.some((token) => token.kind === "boolean" && token.text === "true"));
+  assert.ok(tokens.some((token) => token.kind === "number" && token.text === "2"));
+  assert.ok(tokens.some((token) => token.kind === "punctuation" && token.text === ":"));
+});
+
 test("eventToTimelineItems folds protocol correction noise", () => {
   const items = eventToTimelineItems({ type: "error", category: "protocol", error: "A workspace tool is required before the final answer. Asking the model to call a tool." });
   assert.deepEqual(items, []);
+});
+
+test("eventToTimelineItems hides parse noise and unwraps final markdown", () => {
+  assert.deepEqual(eventToTimelineItems({ type: "error", category: "parse", error: "Unexpected non-whitespace character after JSON" }), []);
+  const final = eventToTimelineItems({ type: "final", answer: '{"answer":"你好！有什么可以帮你的？"}' });
+  assert.equal(final[0]?.kind, "final");
+  assert.equal(final[0]?.kind === "final" ? final[0].text : "", "你好！有什么可以帮你的？");
+});
+
+test("extractDisplayMarkdown strips protocol wrappers", () => {
+  assert.equal(extractDisplayMarkdown('{"action":"final","answer":"# 标题\\n\\n正文"}'), "# 标题\n\n正文");
+  assert.equal(extractDisplayMarkdown('```json\n{"answer":"ok"}\n```'), "ok");
+  assert.equal(extractDisplayMarkdown("# Already markdown"), "# Already markdown");
+  assert.equal(piLikeModelEventsToTimeline([{ type: "text_delta", text: '{"answer":"ok"}' }]).length, 0);
+});
+
+test("normalizeDisplayMarkdown restores escaped markdown before parsing", () => {
+  assert.equal(normalizeDisplayMarkdown('"#### Title\\n- item"'), "#### Title\n- item");
+  assert.equal(normalizeDisplayMarkdown('{"answer":"#### Title\\n- item"}'), "#### Title\n- item");
+  const lines = markdownPreview('{"answer":"#### Current goal\\n- Add `skill` file\\n- Verify"}', false);
+  assert.equal(lines[0]?.kind, "heading");
+  assert.equal(lines[1]?.kind, "bullet");
+  assert.equal(lines[2]?.kind, "bullet");
+});
+
+test("markdown parser accepts lightly indented markdown structures", () => {
+  const lines = markdownPreview("  #### Title\n  - item\n  1. next", false);
+  assert.equal(lines[0]?.kind, "heading");
+  assert.equal(lines[1]?.kind, "bullet");
+  assert.equal(lines[2]?.kind, "ordered");
 });
 
 test("detailForItem adds provider error suggestions", () => {
@@ -233,23 +382,41 @@ test("timeline markdown expands answers but collapses tools and errors by defaul
   assert.match(expandedError?.map((line) => line.text).join("\n") ?? "", /Unexpected JSON/);
 });
 
+test("timeline filtering hides internal payloads and empty activity in compact mode", () => {
+  const internal = timelineRenderBlocks([
+    { kind: "assistant_text", text: '{"tool":"read_file","input":{"path":"package.json"}}' },
+    { kind: "thinking", turn: 1, text: "raw thought only" },
+    { kind: "final", text: '{"answer":"#### Done\\n- ok"}' }
+  ], "", false);
+  assert.equal(internal.length, 1);
+  assert.equal(internal[0]?.kind, "message");
+  assert.equal(internal[0]?.kind === "message" ? internal[0].item.kind : undefined, "final");
+  assert.equal(internal[0]?.kind === "message" ? internal[0].markdown?.[0]?.kind : undefined, "heading");
+
+  const expanded = timelineRenderBlocks([
+    { kind: "tool_request", turn: 1, tool: "read_file", description: "Read", input: { path: "package.json" } },
+    { kind: "tool_result", turn: 1, tool: "read_file", ok: true, output: "raw output", status: "ok", metadata: { path: "package.json" } }
+  ], "", true);
+  assert.match(expanded[0]?.kind === "activity" ? expanded[0].details.join("\n") : "", /raw output/);
+});
+
 test("timelineRenderBlocks groups operational activity between messages", () => {
   const blocks = timelineRenderBlocks([
-    { kind: "user", text: "package.json里面有什么" },
+    { kind: "user", text: "What is in package.json?" },
     { kind: "thinking", turn: 1, text: "Need to inspect package metadata." },
     { kind: "tool_request", turn: 1, tool: "read_file", description: "Read package.json", input: { path: "package.json" } },
     { kind: "tool_result", turn: 1, tool: "read_file", ok: true, output: "{\n  \"name\": \"mini-code-agent\"\n}", status: "ok", metadata: { path: "package.json" } },
     { kind: "tool_request", turn: 1, tool: "run_command", description: "Run npm test", input: { command: "npm test" } },
     { kind: "tool_result", turn: 1, tool: "run_command", ok: true, output: "passed", status: "ok", metadata: { command: "npm test" } },
-    { kind: "final", text: "# 结果\n\n- name: mini-code-agent" }
+    { kind: "final", text: "# Result\n\n- name: mini-code-agent" }
   ], "", false);
 
   assert.equal(blocks.length, 3);
   assert.equal(blocks[0]?.kind, "message");
   assert.equal(blocks[0]?.kind === "message" ? blocks[0].item.kind : undefined, "user");
   assert.equal(blocks[1]?.kind, "activity");
-  assert.match(blocks[1]?.kind === "activity" ? blocks[1].summary : "", /已探索 1 次/);
-  assert.match(blocks[1]?.kind === "activity" ? blocks[1].summary : "", /已运行 1 条命令/);
+  assert.match(blocks[1]?.kind === "activity" ? blocks[1].summary : "", /inspected 1/);
+  assert.match(blocks[1]?.kind === "activity" ? blocks[1].summary : "", /ran 1 command/);
   assert.deepEqual(blocks[1]?.kind === "activity" ? blocks[1].details : [], []);
   assert.equal(blocks[2]?.kind, "message");
   assert.equal(blocks[2]?.kind === "message" ? blocks[2].item.kind : undefined, "final");
@@ -261,16 +428,16 @@ test("timelineRenderBlocks keeps errors separate and expands activity details", 
     { kind: "tool_request", turn: 1, tool: "search", description: "Search source", input: { query: "timeline" } },
     { kind: "tool_result", turn: 1, tool: "search", ok: true, output: "src/ui/App.tsx", status: "ok" },
     { kind: "error", category: "parse", text: "Unexpected non-whitespace character after JSON\nposition 180" }
-  ], "正在总结\n- done", true);
+  ], "Summarizing\n- done", true);
 
   assert.equal(blocks[0]?.kind, "activity");
-  assert.match(blocks[0]?.kind === "activity" ? blocks[0].summary : "", /已探索 1 次/);
-  assert.match(blocks[0]?.kind === "activity" ? blocks[0].details.join("\n") : "", /调用 search/);
+  assert.match(blocks[0]?.kind === "activity" ? blocks[0].summary : "", /inspected 1/);
+  assert.match(blocks[0]?.kind === "activity" ? blocks[0].details.join("\n") : "", /called search/);
   assert.equal(blocks[1]?.kind, "message");
   assert.equal(blocks[1]?.kind === "message" ? blocks[1].item.kind : undefined, "error");
   assert.equal(blocks[2]?.kind, "message");
   assert.equal(blocks[2]?.kind === "message" ? blocks[2].item.kind : undefined, "assistant_text");
-  assert.match(blocks[2]?.kind === "message" && blocks[2].item.kind === "assistant_text" ? blocks[2].item.text : "", /正在总结/);
+  assert.match(blocks[2]?.kind === "message" && blocks[2].item.kind === "assistant_text" ? blocks[2].item.text : "", /Summarizing/);
 });
 
 test("plan record renders as compact ready message and expands markdown", () => {
@@ -288,9 +455,10 @@ test("planSummaryRows exposes review-card counts and detail keeps full plan", ()
   const plan = planRecord();
   const rows = planSummaryRows(plan);
   assert.ok(rows.some((row) => row.label === "steps" && row.value === "2"));
-  assert.ok(rows.some((row) => row.label === "risks" && row.value === "1"));
+  assert.ok(rows.some((row) => row.label === "risks" && /Prompt drift/.test(row.value)));
   assert.ok(rows.some((row) => row.label === "files" && /src\/ui\/App\.tsx/.test(row.value)));
-  assert.ok(rows.some((row) => row.label === "accept" && /Plan card/.test(row.value)));
+  assert.ok(rows.some((row) => row.label === "validation" && /typecheck/.test(row.value)));
+  assert.ok(rows.some((row) => row.label === "acceptance" && /Plan card/.test(row.value)));
   const detail = detailForItem({ kind: "plan_record", plan }, true);
   assert.match(detail?.body ?? "", /Full plan body/);
   assert.match(detail?.body ?? "", /tool read_file/);
@@ -346,9 +514,22 @@ test("command groups keep slash menu stable and grouped", () => {
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/permissions")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/skills")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/plan <request>")));
+  assert.ok(commandGroups.some((group) => group.title === "Config" && group.commands.includes("/doctor")));
+  assert.ok(commandGroups.some((group) => group.title === "Config" && group.commands.includes("/features")));
   assert.ok(commandGroups.some((group) => group.title === "View" && group.commands.includes("/details")));
   assert.ok(slashCommands.includes("/status"));
+  assert.ok(slashCommands.includes("/model"));
   assert.match(emptyStates.timeline, /No activity/);
+});
+
+test("renderCommandHelp shows grouped command descriptions", () => {
+  const help = renderCommandHelp();
+
+  assert.match(help, /Session:/);
+  assert.match(help, /Work:/);
+  assert.match(help, /Config:/);
+  assert.match(help, /\/doctor\s+Run local configuration diagnostics/);
+  assert.match(help, /\/skills\s+List discovered project skills/);
 });
 
 test("welcome model mirrors the compact Claude Code style start screen", () => {
@@ -359,11 +540,49 @@ test("welcome model mirrors the compact Claude Code style start screen", () => {
 });
 
 test("slash filtering prioritizes commands before skill entries", () => {
-  const entries = filterCommandsAndSkills("/ski", [{ name: "skill-generator", description: "Generate a project skill", path: "skills/skill-generator.md", content: "", allowedTools: [], disableModelInvocation: false }]);
+  const entries = filterCommandsAndSkills("/ski", [{ id: "project:skill-generator", name: "skill-generator", displayName: "skill-generator", description: "Generate a project skill", path: "skills/skill-generator.md", content: "", allowedTools: [], disableModelInvocation: false }]);
 
   assert.equal(entries[0]?.command, "/skills");
-  assert.equal(entries[1]?.command, "/skill:");
-  assert.equal(entries[2]?.command, "/skill:skill-generator");
+  assert.equal(entries[1]?.command, "/skill inspect <name>");
+  assert.equal(entries[2]?.command, "/skill reload");
+  assert.equal(entries[3]?.command, "/skill:<name> <args>");
+  assert.equal(entries[4]?.command, "/skill:skill-generator");
+  assert.match(entries[4]?.description ?? "", /default project:project:skill-generator/);
+});
+
+test("slash filtering supports subcommands and exact skill ids", () => {
+  const entries = filterCommandsAndSkills("/mcp ", []);
+  assert.equal(entries[0]?.command, "/mcp tools");
+  assert.equal(entries[1]?.command, "/mcp resources");
+  assert.equal(entries[2]?.command, "/mcp prompts");
+  assert.equal(entries[3]?.command, "/mcp reconnect <server>");
+
+  const skills = [
+    { id: "project:browser", name: "browser", displayName: "browser", description: "Project browser", path: "project/SKILL.md", content: "", allowedTools: [], disableModelInvocation: false },
+    { id: "plugin:browser:openai-bundled-browser", name: "browser", displayName: "browser", description: "Plugin browser", path: "plugin/SKILL.md", content: "", allowedTools: [], disableModelInvocation: false, shadowedBy: "project:browser", source: "plugin" as const }
+  ];
+  const skillEntries = filterCommandsAndSkills("/skill:plugin", skills);
+  assert.equal(skillEntries[0]?.command, "/skill:plugin:browser:openai-bundled-browser");
+  assert.match(skillEntries[0]?.description ?? "", /shadowed plugin:plugin:browser:openai-bundled-browser/);
+});
+
+test("skillPickerRows filters skills and exposes Claude Code style metadata", () => {
+  const rows = skillPickerRows([
+    { id: "global:find-skills", name: "find-skills", displayName: "find-skills", description: "Find skills", path: "find/SKILL.md", content: "hello world", allowedTools: [], disableModelInvocation: false, source: "global" },
+    { id: "plugin:browser:openai-bundled-browser", name: "browser", displayName: "browser", description: "Browser automation", path: "browser/SKILL.md", content: "many words here", allowedTools: [], disableModelInvocation: true, source: "plugin", shadowedBy: "project:browser" }
+  ], "browser");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.name, "browser");
+  assert.equal(rows[0]?.status, "off");
+  assert.equal(rows[0]?.source, "plugin");
+  assert.match(rows[0]?.detail ?? "", /shadowed by project:browser/);
+
+  const all = skillPickerRows([
+    { id: "global:find-skills", name: "find-skills", displayName: "find-skills", description: "Find skills", path: "find/SKILL.md", content: "hello world", allowedTools: [], disableModelInvocation: false, source: "global" }
+  ], "");
+  assert.equal(all[0]?.source, "user");
+  assert.ok((all[0]?.tokens ?? 0) >= 10);
 });
 
 function pendingApproval(): PendingApproval {

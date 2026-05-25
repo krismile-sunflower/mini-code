@@ -7,7 +7,7 @@ export type DetailType = "message" | "plan" | "tool" | "code_change" | "permissi
 export type CodeChangeStatus = "planned" | "checked" | "applied";
 
 export type TimelineItem =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; queued?: boolean }
   | { kind: "assistant_text"; text: string }
   | { kind: "plan"; turn: number; todos: TaskTodo[] }
   | { kind: "plan_record"; plan: PlanRecord }
@@ -62,9 +62,55 @@ export interface TimelineLabel {
   severity: TimelineSeverity;
 }
 
+export interface ClaudeDisplay {
+  role: "user" | "assistant" | "activity" | "system" | "error";
+  marker: string;
+  markerColor: string;
+  textColor: string;
+  background?: string;
+}
+
+export interface ClaudeActivityLine {
+  marker: string;
+  markerColor: string;
+  text: string;
+  textColor: string;
+}
+
+export interface RunUsageEstimate {
+  inputTokens: number;
+  outputTokens: number;
+  thoughtTokens: number;
+  toolCount: number;
+  elapsedSeconds: number;
+  lastActivity: "thinking" | "tool" | "permission" | "answer" | "idle";
+}
+
+export interface ActivityDisplayState {
+  running: boolean;
+  elapsedSeconds?: number;
+  outputTokens: number;
+  thoughtTokens: number;
+}
+
+export interface InputStatusModel {
+  prompt: string;
+  promptColor: string;
+  runningLine?: string;
+  runningColor: string;
+  usageLine: string;
+  hintLine?: string;
+}
+
 export interface PlanSummaryRow {
   label: string;
   value: string;
+}
+
+export interface ApprovalCardRow {
+  label: string;
+  value: string;
+  tone?: "normal" | "warning" | "danger" | "muted" | "accent";
 }
 
 export type MarkdownLineKind = "heading" | "paragraph" | "bullet" | "ordered" | "task" | "quote" | "code" | "hr" | "blank";
@@ -75,6 +121,13 @@ export interface MarkdownLine {
   level?: number;
   checked?: boolean;
   language?: string;
+}
+
+export type CodeTokenKind = "key" | "string" | "number" | "boolean" | "null" | "punctuation" | "plain";
+
+export interface CodeToken {
+  kind: CodeTokenKind;
+  text: string;
 }
 
 export type TimelineRenderBlock =
@@ -107,6 +160,97 @@ export function statusModel(input: {
   };
 }
 
+export function estimateTextTokens(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  const cjk = trimmed.match(/[\u3400-\u9fff]/g)?.length ?? 0;
+  const latin = trimmed.replace(/[\u3400-\u9fff]/g, " ").match(/[A-Za-z0-9_./:-]+/g)?.length ?? 0;
+  const punctuation = Math.ceil(trimmed.replace(/\s/g, "").length / 18);
+  return Math.max(1, Math.ceil(cjk * 1.1 + latin * 1.25 + punctuation));
+}
+
+export function estimateRunUsage(items: TimelineItem[], streamingText: string, elapsedSeconds: number): RunUsageEstimate {
+  let lastUserIndex = -1;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.kind === "user" && !item.queued) {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  const recent = lastUserIndex >= 0 ? items.slice(lastUserIndex) : items;
+  const lastUser = lastUserIndex >= 0 ? items[lastUserIndex] : undefined;
+  const inputText = lastUser?.kind === "user" ? lastUser.text : "";
+  let outputText = streamingText;
+  let thoughtText = "";
+  let toolCount = 0;
+  let lastActivity: RunUsageEstimate["lastActivity"] = "idle";
+
+  for (const item of recent) {
+    if (item.kind === "assistant_text" || item.kind === "final") {
+      outputText += `\n${item.text}`;
+      lastActivity = "answer";
+    } else if (item.kind === "thinking") {
+      thoughtText += `\n${item.text}`;
+      lastActivity = "thinking";
+    } else if (item.kind === "tool_request") {
+      toolCount += 1;
+      lastActivity = "tool";
+    } else if (item.kind === "permission") {
+      lastActivity = "permission";
+    }
+  }
+
+  return {
+    inputTokens: estimateTextTokens(inputText),
+    outputTokens: estimateTextTokens(outputText),
+    thoughtTokens: estimateTextTokens(thoughtText),
+    toolCount,
+    elapsedSeconds,
+    lastActivity
+  };
+}
+
+export function inputStatusModel(input: {
+  status: StatusModel;
+  promptInput: string;
+  usage: RunUsageEstimate;
+  hasConversation: boolean;
+  expanded: boolean;
+  detailsVisible: boolean;
+  aborting: boolean;
+  queueCount?: number;
+}): InputStatusModel {
+  const model = `${input.status.provider}:${truncateMiddle(input.status.model, 26)}`;
+  const totalTokens = input.usage.inputTokens + input.usage.outputTokens + input.usage.thoughtTokens;
+  const queueText = input.queueCount ? ` | queued ${input.queueCount}` : "";
+  const usageLine = `${model} | turn ${input.status.turn} | msg ${input.status.messages} | ~${totalTokens} tokens | tools ${input.usage.toolCount}${queueText} | ${permissionModeLabel(input.status.permissionMode)}`;
+  if (input.status.state === "running" || input.status.state === "aborting") {
+    const action = input.usage.lastActivity === "tool" ? "Using tools" : input.usage.lastActivity === "answer" ? "Answering" : "Blanching";
+    const queued = input.queueCount ? ` | queued ${input.queueCount}` : "";
+    return {
+      prompt: "",
+      promptColor: input.aborting ? "red" : "gray",
+      runningLine: `* ${action}... ${Math.max(1, input.usage.elapsedSeconds)}s | out ${input.usage.outputTokens} | thought ${input.usage.thoughtTokens} | tools ${input.usage.toolCount}${queued} | ${input.aborting ? "stopping" : "esc"}`,
+      runningColor: input.aborting ? "red" : "#ff7a45",
+      usageLine,
+      hintLine: input.expanded ? "expanded details on (ctrl+o to collapse)" : "compact details (ctrl+o to expand)"
+    };
+  }
+
+  const modeHint = input.detailsVisible || input.expanded || input.status.permissionMode !== "default"
+    ? `shift+tab ${permissionModeLabel(input.status.permissionMode)} | /details ${input.detailsVisible ? "on" : "off"} | /expand ${input.expanded ? "on" : "off"} | ctrl+o ${input.expanded ? "collapse" : "expand"}`
+    : input.hasConversation ? undefined : "? for shortcuts";
+
+  return {
+    prompt: `> ${input.promptInput}`,
+    promptColor: "white",
+    runningColor: "gray",
+    usageLine,
+    hintLine: modeHint
+  };
+}
+
 export function headerFields(status: StatusModel): HeaderField[] {
   return [
     { label: "state", value: status.state, color: stateColor(status.state) },
@@ -123,14 +267,28 @@ export function headerFields(status: StatusModel): HeaderField[] {
 
 export const commandGroups: CommandGroup[] = [
   { title: "Session", commands: ["/help", "/status", "/memory", "/init", "/sessions", "/new", "/resume <id>", "/rename <title>", "/export-session <path>"] },
-  { title: "Work", commands: ["/plan <request>", "/execute <plan-id>", "/tools", "/permissions", "/skills", "/skill:<name> <args>"] },
-  { title: "View", commands: ["/details", "/expand", "/history", "/clear"] },
+  { title: "Work", commands: ["/plan <request>", "/execute <plan-id>", "/tools", "/permissions", "/skills", "/skill inspect <name>", "/skill reload", "/skill:<name> <args>", "/capabilities"] },
+  { title: "MCP", commands: ["/mcp", "/mcp tools", "/mcp resources", "/mcp prompts", "/mcp reconnect <server>"] },
+  { title: "View", commands: ["/details", "/expand", "/history", "/clear", "/queue", "/queue clear"] },
   { title: "Context", commands: ["/compact", "/summary"] },
-  { title: "Config", commands: ["/model (configure with --model)", "/pi (use --pi-pass-through -- ...)"] },
+  { title: "Config", commands: ["/model", "/config", "/doctor", "/features", "/login", "/pi (use --pi-pass-through -- ...)"] },
   { title: "Exit", commands: ["/exit"] }
 ];
 
 export const slashCommands = commandGroups.flatMap((group) => group.commands);
+const commandRank = new Map(slashCommands.map((command, index) => [command, index]));
+
+export function renderCommandHelp(): string {
+  return commandGroups
+    .map((group) => [
+      `${group.title}:`,
+      ...group.commands.map((command) => {
+        const key = commandKey(command);
+        return `  ${command.padEnd(32)} ${commandDescriptions[key] ?? ""}`.trimEnd();
+      })
+    ].join("\n"))
+    .join("\n\n");
+}
 
 export const emptyStates = {
   timeline: "No activity yet. Ask a question or type /help.",
@@ -167,6 +325,7 @@ export function eventToTimelineItems(event: AgentEvent): TimelineItem[] {
   if (event.type === "model_stream_delta") return [];
   if (event.type === "model_response") return piLikeModelEventsToTimeline(event.streamEvents ?? []);
   if (event.type === "plan") return [{ kind: "plan", turn: event.turn, todos: event.todos }];
+  if (event.type === "error" && event.category === "parse") return [];
   if (event.type === "error" && event.category === "protocol" && /Asking the model/i.test(event.error)) return [];
   if (event.type === "tool_request") {
     const items: TimelineItem[] = [];
@@ -195,7 +354,7 @@ export function eventToTimelineItems(event: AgentEvent): TimelineItem[] {
     return codeChange ? [result, codeChange] : [result];
   }
   if (event.type === "compaction") return [{ kind: "compact", text: event.summary || "[no summary]" }];
-  if (event.type === "final") return [{ kind: "final", text: event.answer }];
+  if (event.type === "final") return [{ kind: "final", text: extractDisplayMarkdown(event.answer) }];
   return [{ kind: "error", text: event.error, category: event.category }];
 }
 
@@ -207,8 +366,68 @@ export function piLikeModelEventsToTimeline(events: ModelStreamEvent[]): Timelin
   const thinking = events.filter((event) => event.type === "thinking_delta").map((event) => event.text).join("").trim();
   const items: TimelineItem[] = [];
   if (thinking) items.push({ kind: "thinking", turn: 0, text: thinking });
-  if (text && !looksLikeDecisionJson(text)) items.push({ kind: "assistant_text", text });
+  if (text && !looksLikeInternalPayload(text)) items.push({ kind: "assistant_text", text: extractDisplayMarkdown(text) });
   return items;
+}
+
+export function extractDisplayMarkdown(text: string): string {
+  const trimmed = normalizeDisplayMarkdown(text).trim();
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const jsonText = firstJsonObject(withoutFence);
+  if (!jsonText) return normalizeDisplayMarkdown(text);
+  try {
+    const parsed = JSON.parse(jsonText) as unknown;
+    if (isObject(parsed) && typeof parsed.answer === "string") return normalizeDisplayMarkdown(parsed.answer);
+  } catch {
+    return normalizeDisplayMarkdown(text);
+  }
+  return normalizeDisplayMarkdown(text);
+}
+
+export function normalizeDisplayMarkdown(text: string): string {
+  let value = text.trim();
+  const decoded = decodeJsonStringLiteral(value);
+  if (decoded !== undefined) value = decoded.trim();
+  const wrapper = decodeJsonAnswerWrapper(value);
+  if (wrapper !== undefined) value = wrapper.trim();
+  if (shouldUnescapeMarkdown(value)) value = unescapeTextMarkup(value);
+  return value;
+}
+
+function decodeJsonStringLiteral(value: string): string | undefined {
+  if (!((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))) return undefined;
+  try {
+    return JSON.parse(value) as string;
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeJsonAnswerWrapper(value: string): string | undefined {
+  const withoutFence = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const jsonText = firstJsonObject(withoutFence);
+  if (!jsonText) return undefined;
+  try {
+    const parsed = JSON.parse(jsonText) as unknown;
+    if (isObject(parsed) && typeof parsed.answer === "string") return parsed.answer;
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function shouldUnescapeMarkdown(value: string): boolean {
+  if (!/\\[nrt"]/.test(value)) return false;
+  if (/^```/.test(value)) return false;
+  return /\\n\s*(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>|```)|\\n\\n|\\t/.test(value);
+}
+
+function unescapeTextMarkup(value: string): string {
+  return value
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "  ")
+    .replace(/\\"/g, "\"");
 }
 
 export function codeChangeFromToolRequest(event: Extract<AgentEvent, { type: "tool_request" }>): Extract<TimelineItem, { kind: "code_change" }> | undefined {
@@ -255,7 +474,7 @@ export function renderDiffLines(diff: string, expanded: boolean): Array<{ text: 
   const lines: Array<{ text: string; color: string }> = [];
   for (const line of diff.split(/\r?\n/)) {
     if (lines.length >= maxLines || chars + line.length > maxChars) {
-      lines.push({ text: "[diff truncated, type /expand]", color: "gray" });
+      lines.push({ text: "[diff truncated, type /expand or press ctrl+o]", color: "gray" });
       break;
     }
     lines.push({ text: line || " ", color: diffLineColor(line) });
@@ -288,6 +507,14 @@ export function timelineLabel(item: TimelineItem): TimelineLabel {
   if (item.kind === "final") return { marker: "done", color: "green", text: "answer", severity: "success" };
   if (item.kind === "session") return { marker: "session", color: "cyan", text: truncateEnd(item.text.split(/\r?\n/)[0] ?? "session", 180), severity: "neutral" };
   return { marker: item.category ? `err:${item.category}` : "error", color: "red", text: truncateEnd(firstLine(item.text), 120), severity: "danger" };
+}
+
+export function claudeDisplay(item: TimelineItem): ClaudeDisplay {
+  if (item.kind === "user") return { role: "user", marker: ">", markerColor: "#bfc1ff", textColor: "white", background: "#3a3a3a" };
+  if (item.kind === "assistant_text" || item.kind === "final") return { role: "assistant", marker: "●", markerColor: "white", textColor: "white" };
+  if (item.kind === "error") return { role: "error", marker: "*", markerColor: "red", textColor: "red" };
+  if (item.kind === "session" || item.kind === "compact") return { role: "system", marker: "", markerColor: "gray", textColor: "gray" };
+  return { role: "activity", marker: "●", markerColor: "gray", textColor: "gray" };
 }
 
 export function detailForItem(item: TimelineItem | undefined, expanded: boolean): DetailModel | undefined {
@@ -330,6 +557,7 @@ function errorDetail(item: Extract<TimelineItem, { kind: "error" }>): string {
 
 export function timelineMarkdownLines(item: TimelineItem, expanded: boolean): MarkdownLine[] | undefined {
   if (item.kind === "assistant_text" || item.kind === "final" || item.kind === "session" || item.kind === "compact") {
+    if (item.kind === "assistant_text" && !expanded && looksLikeInternalPayload(item.text)) return undefined;
     return markdownPreview(item.text, expanded);
   }
   if (item.kind === "plan") {
@@ -352,10 +580,14 @@ export function timelineRenderBlocks(items: TimelineItem[], streamingText: strin
 
   const flushActivity = () => {
     if (activity.length === 0) return;
+    if (!expanded && !hasCompactActivity(activity)) {
+      activity = [];
+      return;
+    }
     blocks.push({
       kind: "activity",
-      summary: activitySummary(activity),
-      details: expanded ? activityDetails(activity) : [],
+      summary: asciiActivitySummary(activity),
+      details: expanded ? asciiActivityDetails(activity) : [],
       items: activity
     });
     activity = [];
@@ -367,7 +599,9 @@ export function timelineRenderBlocks(items: TimelineItem[], streamingText: strin
       continue;
     }
     flushActivity();
-    blocks.push({ kind: "message", item, markdown: timelineMarkdownLines(item, expanded) });
+    const markdown = timelineMarkdownLines(item, expanded);
+    if (item.kind === "assistant_text" && !expanded && !markdown) continue;
+    blocks.push({ kind: "message", item, markdown });
   }
 
   flushActivity();
@@ -385,7 +619,116 @@ function isActivityItem(item: TimelineItem): boolean {
   return item.kind === "thinking" || item.kind === "tool_request" || item.kind === "tool_result" || item.kind === "code_change" || item.kind === "permission";
 }
 
-function activitySummary(items: TimelineItem[]): string {
+function hasCompactActivity(items: TimelineItem[]): boolean {
+  return items.some((item) => item.kind === "tool_request" || item.kind === "code_change" || item.kind === "permission");
+}
+
+export function claudeActivityLines(items: TimelineItem[], expanded: boolean, state?: ActivityDisplayState): ClaudeActivityLine[] {
+  const lines: ClaudeActivityLine[] = [];
+  const thinking = items.filter((item): item is Extract<TimelineItem, { kind: "thinking" }> => item.kind === "thinking");
+  const toolRequests = items.filter((item): item is Extract<TimelineItem, { kind: "tool_request" }> => item.kind === "tool_request");
+  const codeChanges = items.filter((item): item is Extract<TimelineItem, { kind: "code_change" }> => item.kind === "code_change");
+  const permissions = items.filter((item): item is Extract<TimelineItem, { kind: "permission" }> => item.kind === "permission");
+
+  for (const request of compactToolRequests(toolRequests, items)) {
+    lines.push(request);
+  }
+  for (const change of compactCodeChanges(codeChanges)) {
+    const fileCount = change.files.length || 1;
+    lines.push({ marker: "●", markerColor: "gray", textColor: "gray", text: `${change.status === "applied" ? "Edited" : "Editing"} ${fileCount} file${fileCount === 1 ? "" : "s"} (ctrl+o to expand)` });
+  }
+  for (const item of permissions) {
+    lines.push({ marker: item.blocked ? "*" : "●", markerColor: item.blocked ? "red" : "yellow", textColor: item.blocked ? "red" : "yellow", text: item.blocked ? `Permission blocked: ${item.text}` : `Permission required: ${item.text}` });
+  }
+  const latestThinking = thinking.at(-1);
+  if (latestThinking && state?.running) {
+    lines.push({ marker: "*", markerColor: "#ff7a45", textColor: "#ff7a45", text: blanchingText(thinking.map((item) => item.text).join("\n"), state) });
+  }
+  if (expanded) {
+    for (const detail of asciiActivityDetails(items)) {
+      lines.push({ marker: " ", markerColor: "gray", textColor: "gray", text: detail });
+    }
+  }
+  if (!expanded && lines.length === 0) return [];
+  if (lines.length === 0) return [{ marker: "●", markerColor: "gray", textColor: "gray", text: asciiActivitySummary(items) }];
+  return lines;
+}
+
+function compactToolRequests(toolRequests: Array<Extract<TimelineItem, { kind: "tool_request" }>>, items: TimelineItem[]): ClaudeActivityLine[] {
+  const grouped = new Map<string, { request: Extract<TimelineItem, { kind: "tool_request" }>; unitCount: number }>();
+  for (const request of toolRequests) {
+    const key = toolActivityKey(request);
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.unitCount = Math.max(existing.unitCount, toolUnitCount(request));
+    } else {
+      grouped.set(key, { request, unitCount: toolUnitCount(request) });
+    }
+  }
+
+  const byKind = new Map<string, { request: Extract<TimelineItem, { kind: "tool_request" }>; unitCount: number }>();
+  for (const groupedRequest of grouped.values()) {
+    const kind = toolActivityKind(groupedRequest.request);
+    const existing = byKind.get(kind);
+    if (existing) {
+      existing.unitCount += groupedRequest.unitCount;
+    } else {
+      byKind.set(kind, groupedRequest);
+    }
+  }
+
+  return Array.from(byKind.values()).map((entry) => toolActivityLine(entry.request, items, entry.unitCount));
+}
+
+function compactCodeChanges(codeChanges: Array<Extract<TimelineItem, { kind: "code_change" }>>): Array<Extract<TimelineItem, { kind: "code_change" }>> {
+  const grouped = new Map<string, Extract<TimelineItem, { kind: "code_change" }>>();
+  for (const change of codeChanges) {
+    const key = `${change.status}:${change.files.slice().sort().join("|") || change.summary}`;
+    if (!grouped.has(key)) grouped.set(key, change);
+  }
+  return Array.from(grouped.values());
+}
+
+function toolActivityKey(request: Extract<TimelineItem, { kind: "tool_request" }>): string {
+  return `${request.tool}:${toolTarget(request.tool, request.input) || JSON.stringify(request.input)}`;
+}
+
+function toolActivityKind(request: Extract<TimelineItem, { kind: "tool_request" }>): string {
+  if (request.tool === "run_command") return "command";
+  if (isExplorationTool(request.tool)) return "explore";
+  return request.tool;
+}
+
+function toolActivityLine(request: Extract<TimelineItem, { kind: "tool_request" }>, items: TimelineItem[], unitCount = toolUnitCount(request)): ClaudeActivityLine {
+  const completed = items.some((item) => item.kind === "tool_result" && item.tool === request.tool && item.turn === request.turn);
+  const count = Math.max(1, unitCount);
+  const plural = count === 1 ? "" : "s";
+  if (request.tool === "run_command") {
+    return { marker: "●", markerColor: "gray", textColor: "gray", text: `${completed ? "Ran" : "Running"} command (ctrl+o to expand)` };
+  }
+  if (isExplorationTool(request.tool)) {
+    const verb = completed ? "Read" : "Reading";
+    const suffix = completed ? "" : "...";
+    return { marker: "●", markerColor: "gray", textColor: "gray", text: `${verb} ${count} file${plural}${suffix} (ctrl+o to expand)` };
+  }
+  return { marker: "●", markerColor: "gray", textColor: "gray", text: `${completed ? "Used" : "Using"} ${request.tool} (ctrl+o to expand)` };
+}
+
+function toolUnitCount(request: Extract<TimelineItem, { kind: "tool_request" }>): number {
+  if (request.tool === "read_many_files" && Array.isArray(request.input.paths)) return Math.max(1, request.input.paths.length);
+  if (typeof request.input.path === "string" || typeof request.input.query === "string") return 1;
+  return 1;
+}
+
+function blanchingText(thought: string, state?: ActivityDisplayState): string {
+  const thoughtTokens = state?.thoughtTokens || estimateTextTokens(thought);
+  const outputTokens = state?.outputTokens ?? 0;
+  const tokenText = outputTokens > 0 ? `down ${outputTokens} tokens` : `${thoughtTokens} thought tokens`;
+  const elapsedText = typeof state?.elapsedSeconds === "number" && state.elapsedSeconds > 0 ? ` | thought for ${Math.max(1, state.elapsedSeconds)}s` : "";
+  return `Blanching... (${tokenText}${elapsedText})`;
+}
+
+function asciiActivitySummary(items: TimelineItem[]): string {
   let explored = 0;
   let commands = 0;
   let edits = 0;
@@ -403,27 +746,27 @@ function activitySummary(items: TimelineItem[]): string {
   }
 
   const parts: string[] = [];
-  if (explored > 0) parts.push(`已探索 ${explored} 次`);
-  if (commands > 0) parts.push(`已运行 ${commands} 条命令`);
-  if (edits > 0) parts.push(`已编辑 ${edits} 处`);
-  if (approvals > 0) parts.push(`需批准 ${approvals} 项`);
-  return parts.length > 0 ? parts.join("，") : `已处理 ${items.length} 项活动`;
+  if (explored > 0) parts.push(`inspected ${explored}`);
+  if (commands > 0) parts.push(`ran ${commands} command${commands === 1 ? "" : "s"}`);
+  if (edits > 0) parts.push(`edited ${edits}`);
+  if (approvals > 0) parts.push(`requested ${approvals} approval${approvals === 1 ? "" : "s"}`);
+  return parts.length > 0 ? parts.join(" | ") : `processed ${items.length} event${items.length === 1 ? "" : "s"}`;
 }
 
-function activityDetails(items: TimelineItem[]): string[] {
+function asciiActivityDetails(items: TimelineItem[]): string[] {
   const details: string[] = [];
   for (const item of items) {
     if (item.kind === "thinking") {
-      details.push(`思考 ${truncateEnd(item.text.replace(/\s+/g, " "), 120)}`);
+      details.push(`thinking ${truncateEnd(item.text.replace(/\s+/g, " "), 120)}`);
     } else if (item.kind === "tool_request") {
-      details.push(`调用 ${toolRequestLabel(item)}`);
+      details.push(`called ${toolRequestLabel(item)}`);
     } else if (item.kind === "tool_result") {
       const output = firstLine(item.output);
-      details.push(`${item.status} ${item.tool}${item.metadata ? metadataSummary(item.metadata) : ""}${output ? ` — ${truncateEnd(output, 100)}` : ""}`);
+      details.push(`${item.status} ${item.tool}${item.metadata ? metadataSummary(item.metadata) : ""}${output ? ` - ${truncateEnd(output, 100)}` : ""}`);
     } else if (item.kind === "code_change") {
       details.push(`${item.status} ${item.summary}`);
     } else if (item.kind === "permission") {
-      details.push(`${item.blocked ? "阻止" : "权限"} ${truncateEnd(item.text.replace(/\s+/g, " "), 120)}`);
+      details.push(`${item.blocked ? "blocked" : "permission"} ${truncateEnd(item.text.replace(/\s+/g, " "), 120)}`);
     }
   }
   return details;
@@ -433,6 +776,19 @@ function isExplorationTool(tool: string): boolean {
   return ["read_file", "read_many_files", "read_tree", "show_file_outline", "search", "list_files", "git_diff", "list_changed_files"].includes(tool);
 }
 
+function looksLikeInternalPayload(text: string): boolean {
+  const raw = text.trim();
+  if (looksLikeDecisionJson(raw)) return true;
+  if (/^\s*{[\s\S]*"(action|tool|tool_calls|tool_call_id|mcp|server|resources|prompts|input|schema|answer)"\s*:/.test(raw)) return true;
+  const normalized = normalizeDisplayMarkdown(text).trim();
+  if (!normalized) return false;
+  if (looksLikeDecisionJson(normalized)) return true;
+  if (/^\s*{[\s\S]*"(action|tool|tool_calls|tool_call_id|mcp|server|resources|prompts|input|schema)"\s*:/.test(normalized)) return true;
+  if (/^\s*\[[\s\S]*"(type|tool|server|resource|prompt)"\s*:/.test(normalized)) return true;
+  if (/\\n\s*[-*]\s+\*\*(Tool Calling|MCP|Skill|核心能力)/.test(text)) return true;
+  return false;
+}
+
 export function planSummaryRows(plan: PlanRecord): PlanSummaryRow[] {
   return [
     { label: "id", value: plan.id },
@@ -440,8 +796,9 @@ export function planSummaryRows(plan: PlanRecord): PlanSummaryRow[] {
     { label: "model", value: plan.model },
     { label: "files", value: plan.files.length ? plan.files.slice(0, 3).join(", ") : "none listed" },
     { label: "steps", value: String(plan.steps.length) },
-    { label: "risks", value: String(plan.risks.length) },
-    { label: "accept", value: plan.acceptanceCriteria.length ? plan.acceptanceCriteria.slice(0, 2).join("; ") : "none listed" },
+    { label: "validation", value: plan.validations.length ? plan.validations.slice(0, 2).join("; ") : "none listed" },
+    { label: "risks", value: plan.risks.length ? plan.risks.slice(0, 2).join("; ") : "none listed" },
+    { label: "acceptance", value: plan.acceptanceCriteria.length ? plan.acceptanceCriteria.slice(0, 2).join("; ") : "none listed" },
     { label: "inspection", value: plan.statusReason === "limited inspection" ? "limited inspection" : `${plan.inspectionEvents.length} events` }
   ];
 }
@@ -463,12 +820,12 @@ export function outputPreview(output: string, expanded: boolean): string {
   const maxLines = expanded ? 80 : 8;
   const clippedLines = output.split(/\r?\n/).slice(0, maxLines).join("\n");
   const clipped = clippedLines.length > maxChars ? clippedLines.slice(0, maxChars) : clippedLines;
-  if (clipped.length < output.length || clippedLines.length < output.length) return `${clipped}\n[truncated, type /expand]`;
+  if (clipped.length < output.length || clippedLines.length < output.length) return `${clipped}\n[truncated, type /expand or press ctrl+o]`;
   return clipped || "[no output]";
 }
 
 export function markdownPreview(markdown: string, expanded: boolean): MarkdownLine[] {
-  const preview = outputPreview(markdown, expanded);
+  const preview = outputPreview(normalizeDisplayMarkdown(markdown), expanded);
   return parseMarkdown(preview);
 }
 
@@ -476,7 +833,8 @@ export function parseMarkdown(markdown: string): MarkdownLine[] {
   const lines: MarkdownLine[] = [];
   let inCode = false;
   let language = "";
-  for (const rawLine of markdown.replace(/\t/g, "  ").split(/\r?\n/)) {
+  for (const sourceLine of normalizeDisplayMarkdown(markdown).replace(/\t/g, "  ").split(/\r?\n/)) {
+    const rawLine = sourceLine.replace(/^\s{1,3}(?=(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s?))/, "");
     const fence = rawLine.match(/^\s*```([\w-]*)\s*$/);
     if (fence) {
       inCode = !inCode;
@@ -498,7 +856,7 @@ export function parseMarkdown(markdown: string): MarkdownLine[] {
       continue;
     }
     if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(rawLine)) {
-      lines.push({ kind: "hr", text: "─".repeat(48) });
+      lines.push({ kind: "hr", text: "-".repeat(48) });
       continue;
     }
     const task = rawLine.match(/^(\s*)[-*+]\s+\[([ xX])\]\s+(.+)$/);
@@ -526,6 +884,72 @@ export function parseMarkdown(markdown: string): MarkdownLine[] {
   return lines.length > 0 ? lines : [{ kind: "paragraph", text: "[no output]" }];
 }
 
+export function tokenizeCodeLine(text: string, language = ""): CodeToken[] {
+  if (!/^(json|jsonc|js|javascript|ts|typescript)?$/i.test(language)) return [{ kind: "plain", text }];
+  const tokens: CodeToken[] = [];
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index] ?? "";
+    if (char === '"' || char === "'") {
+      const { value, end } = readQuoted(text, index, char);
+      const rest = text.slice(end).trimStart();
+      tokens.push({ kind: rest.startsWith(":") ? "key" : "string", text: value });
+      index = end;
+      continue;
+    }
+    const number = text.slice(index).match(/^-?\d+(?:\.\d+)?/);
+    if (number) {
+      tokens.push({ kind: "number", text: number[0] });
+      index += number[0].length;
+      continue;
+    }
+    const word = text.slice(index).match(/^(true|false|null)\b/);
+    if (word) {
+      tokens.push({ kind: word[0] === "null" ? "null" : "boolean", text: word[0] });
+      index += word[0].length;
+      continue;
+    }
+    if (/^[{}\[\]():,]$/.test(char)) {
+      tokens.push({ kind: "punctuation", text: char });
+      index += 1;
+      continue;
+    }
+    const whitespace = text.slice(index).match(/^\s+/)?.[0];
+    if (whitespace) {
+      tokens.push({ kind: "plain", text: whitespace });
+      index += whitespace.length;
+      continue;
+    }
+    const plain = text.slice(index).match(/^[^"'\s{}\[\]():,\d]+/)?.[0] ?? char;
+    tokens.push({ kind: "plain", text: plain });
+    index += plain.length;
+  }
+  return mergePlainTokens(tokens);
+}
+
+function readQuoted(text: string, start: number, quote: string): { value: string; end: number } {
+  let index = start + 1;
+  while (index < text.length) {
+    if (text[index] === "\\") {
+      index += 2;
+      continue;
+    }
+    if (text[index] === quote) return { value: text.slice(start, index + 1), end: index + 1 };
+    index += 1;
+  }
+  return { value: text.slice(start), end: text.length };
+}
+
+function mergePlainTokens(tokens: CodeToken[]): CodeToken[] {
+  const merged: CodeToken[] = [];
+  for (const token of tokens) {
+    const previous = merged.at(-1);
+    if (previous?.kind === "plain" && token.kind === "plain") previous.text += token.text;
+    else merged.push({ ...token });
+  }
+  return merged;
+}
+
 function indentLevel(value: string): number {
   return Math.min(4, Math.floor(value.length / 2));
 }
@@ -547,6 +971,23 @@ export function approvalRows(approval: PendingApproval): Array<{ label: string; 
     ...detailRows
   ];
   return dedupeRows(rows).map((row) => ({ label: row.label, value: truncateEnd(row.value, 120) }));
+}
+
+export function approvalCardRows(approval: PendingApproval): ApprovalCardRow[] {
+  const rows = approvalRows(approval);
+  const value = (label: string) => rows.find((row) => row.label === label)?.value ?? "";
+  const rememberPolicy = value("rememberPolicy") || (approval.requirement.rememberable === false ? "never" : approval.requirement.rememberable ? "available" : "not offered");
+  const command = value("command") || (typeof approval.input.command === "string" ? approval.input.command : "");
+  const target = value("target");
+  const scope = approval.requirement.scope ?? value("scope");
+  return [
+    { label: "risk", value: approval.requirement.risk, tone: approval.requirement.risk === "dangerous" || approval.requirement.blocked ? "danger" : "warning" },
+    { label: "scope", value: scope || "[none]", tone: "normal" },
+    { label: "reason", value: approval.requirement.reason, tone: approval.requirement.blocked ? "danger" : "normal" },
+    { label: "remember", value: rememberPolicy, tone: approval.requirement.rememberable === false ? "muted" : "accent" },
+    { label: "command", value: command || target || "[not a command]", tone: command ? "accent" : "muted" },
+    { label: "path", value: target && target !== command ? target : value("cwd") || "[workspace]", tone: "muted" }
+  ];
 }
 
 export function decisionText(decision: ApprovalDecision): string {
@@ -607,7 +1048,47 @@ function toolResultSeverity(status: "ok" | "failed" | "denied" | "blocked" | "va
 }
 
 function looksLikeDecisionJson(text: string): boolean {
-  return /^\s*\{/.test(text) && /"action"\s*:/.test(text);
+  const jsonText = firstJsonObject(text.trim());
+  if (!jsonText) return false;
+  try {
+    const parsed = JSON.parse(jsonText) as unknown;
+    return isObject(parsed) && (typeof parsed.action === "string" || typeof parsed.answer === "string");
+  } catch {
+    return /^\s*\{/.test(text) && /"action"\s*:/.test(text);
+  }
+}
+
+function firstJsonObject(value: string): string | undefined {
+  const start = value.indexOf("{");
+  if (start === -1) return undefined;
+  let depth = 0;
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+  for (let index = start; index < value.length; index += 1) {
+    const char = value[index] ?? "";
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) inString = false;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      inString = true;
+      quote = char;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return value.slice(start, index + 1);
+    }
+  }
+  return undefined;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function metadataFiles(metadata: ToolMetadata): string[] | undefined {
@@ -681,16 +1162,14 @@ function dedupeRows(rows: Array<{ label: string; value: string }>): Array<{ labe
   });
 }
 
-// ── Welcome screen & command completion ──────────────────────────────────────
 
 export const asciiArt: string[] = [
-  "   ▄▄▄▄▄   ",
-  " ▄███████▄ ",
-  "██ ▀█ █▀ ██",
-  "██▄▄███▄▄██",
-  "  ▀▀ ▀ ▀▀  ",
+  "    ____    ",
+  "  _|    |_  ",
+  " |  [] [] | ",
+  " |   __   | ",
+  "  |_|  |_|  "
 ];
-
 export const welcomeTips = {
   gettingStarted: {
     title: "Tips for getting started",
@@ -701,7 +1180,9 @@ export const welcomeTips = {
   whatsNew: {
     title: "What's new",
     items: [
-      "Check the Mini Code changelog for updates",
+      "Improved error messages and recovery",
+      "Improved slash command and skills UI",
+      "Fixed session capability diffs",
     ],
   },
 };
@@ -711,9 +1192,23 @@ export interface CommandEntry {
   description: string;
 }
 
+export interface SkillPickerRow {
+  skill: SkillInfo;
+  status: "on" | "off";
+  name: string;
+  source: string;
+  tokens: number;
+  detail: string;
+}
+
 export const commandDescriptions: Record<string, string> = {
   "/help": "Show all available commands",
   "/status": "Show session status and configuration",
+  "/model": "Show active provider, model, plan model, and tool protocol",
+  "/config": "Show resolved Mini Code configuration",
+  "/doctor": "Run local configuration diagnostics",
+  "/features": "Show enabled FEATURE_* flags",
+  "/login": "Show provider auth setup guidance",
   "/memory": "Show loaded CLAUDE.md project memory",
   "/init": "Generate CLAUDE.md by analysing this repository",
   "/sessions": "List all saved sessions",
@@ -726,7 +1221,17 @@ export const commandDescriptions: Record<string, string> = {
   "/tools": "List all available tools",
   "/permissions": "Show current permission settings",
   "/skills": "List discovered project skills",
+  "/queue": "Show queued requests",
+  "/queue clear": "Clear queued requests",
+  "/skill inspect": "Inspect one skill or duplicate candidates",
+  "/skill reload": "Rediscover skills without restarting",
   "/skill:": "Run a named skill with optional args",
+  "/mcp": "Show configured MCP servers",
+  "/mcp tools": "Show MCP tools",
+  "/mcp resources": "Show MCP resources",
+  "/mcp prompts": "Show MCP prompts",
+  "/mcp reconnect": "Reconnect one MCP server",
+  "/capabilities": "Show the unified capability snapshot",
   "/details": "Toggle the detailed view panel on/off",
   "/expand": "Toggle expanded diff output",
   "/history": "Toggle extended history view",
@@ -738,26 +1243,93 @@ export const commandDescriptions: Record<string, string> = {
 
 export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[]): CommandEntry[] {
   const query = prefix.toLowerCase();
-  const cmdEntries: CommandEntry[] = Object.entries(commandDescriptions).map(([command, description]) => ({
-    command,
-    description,
-  }));
-  const skillEntries: CommandEntry[] = skills.map((skill) => ({
-    command: `/skill:${skill.name}`,
-    description: skill.description,
-  }));
+  const cmdEntries = commandGroups.flatMap((group) => group.commands.map((command) => commandEntry(command)));
+  const skillEntries = skills.flatMap((skill) => {
+    const status = skill.shadowedBy ? "shadowed" : skill.disableModelInvocation ? "disabled" : "default";
+    const source = skill.source ?? "project";
+    const description = `${status} ${source}:${skill.id} - ${skill.description}`;
+    const entries: CommandEntry[] = [{ command: `/skill:${skill.name}`, description }];
+    if (skill.id !== skill.name) entries.push({ command: `/skill:${skill.id}`, description });
+    return entries;
+  });
   const all = [...cmdEntries, ...skillEntries];
   if (query === "/") return all.slice(0, 12);
   return all
-    .filter((entry) => entry.command.toLowerCase().startsWith(query))
+    .filter((entry) => commandMatches(entry.command, query))
     .sort((left, right) => {
-      const leftExact = left.command.toLowerCase() === query ? 0 : 1;
-      const rightExact = right.command.toLowerCase() === query ? 0 : 1;
+      const leftExact = normalizeCommandTemplate(left.command).toLowerCase() === query ? 0 : 1;
+      const rightExact = normalizeCommandTemplate(right.command).toLowerCase() === query ? 0 : 1;
       if (leftExact !== rightExact) return leftExact - rightExact;
       const leftSkill = left.command.startsWith("/skill:") ? 1 : 0;
       const rightSkill = right.command.startsWith("/skill:") ? 1 : 0;
       if (leftSkill !== rightSkill) return leftSkill - rightSkill;
-      return left.command.localeCompare(right.command);
+      if (leftSkill && rightSkill) {
+        const leftExactSkillId = left.command.slice("/skill:".length).includes(":") ? 1 : 0;
+        const rightExactSkillId = right.command.slice("/skill:".length).includes(":") ? 1 : 0;
+        if (leftExactSkillId !== rightExactSkillId) return leftExactSkillId - rightExactSkillId;
+      }
+      const leftRank = commandRank.get(left.command) ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = commandRank.get(right.command) ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) return leftRank - rightRank;
+      if (left.command === "/skills" && right.command !== "/skills") return -1;
+      if (right.command === "/skills" && left.command !== "/skills") return 1;
+      return commandSortKey(left.command).localeCompare(commandSortKey(right.command));
     })
     .slice(0, 12);
+}
+
+export function skillPickerRows(skills: SkillInfo[], query: string): SkillPickerRow[] {
+  const normalized = query.trim().toLowerCase();
+  return skills
+    .map((skill) => {
+      const source = skill.source === "global" ? "user" : skill.source ?? "project";
+      const duplicateDetail = skill.shadowedBy ? `shadowed by ${skill.shadowedBy}` : skill.id !== `${source}:${skill.name}` ? skill.id : "";
+      return {
+        skill,
+        status: skill.disableModelInvocation ? "off" as const : "on" as const,
+        name: skill.name,
+        source,
+        tokens: estimateSkillTokens(skill),
+        detail: duplicateDetail
+      };
+    })
+    .filter((row) => {
+      if (!normalized) return true;
+      return [row.name, row.source, row.skill.id, row.skill.description, row.detail].some((value) => value.toLowerCase().includes(normalized));
+    })
+    .sort((left, right) => {
+      const leftDefault = left.skill.shadowedBy ? 1 : 0;
+      const rightDefault = right.skill.shadowedBy ? 1 : 0;
+      if (leftDefault !== rightDefault) return leftDefault - rightDefault;
+      return left.name.localeCompare(right.name) || left.skill.id.localeCompare(right.skill.id);
+    });
+}
+
+function estimateSkillTokens(skill: SkillInfo): number {
+  const text = [skill.description, skill.content].filter(Boolean).join(" ");
+  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  return Math.max(10, Math.round(words * 1.3 / 10) * 10);
+}
+
+function commandEntry(command: string): CommandEntry {
+  const key = commandKey(command);
+  return { command, description: commandDescriptions[key] ?? "" };
+}
+
+function commandMatches(command: string, query: string): boolean {
+  const normalized = normalizeCommandTemplate(command).toLowerCase();
+  const compact = commandKey(command).toLowerCase();
+  return normalized.startsWith(query) || compact.startsWith(query);
+}
+
+function commandKey(command: string): string {
+  return command.replace(/\s+<.*$/, "").replace(/\s+\(.+$/, "");
+}
+
+function normalizeCommandTemplate(command: string): string {
+  return command.replace(/\s+<[^>]+>/g, "");
+}
+
+function commandSortKey(command: string): string {
+  return command.replace(/\s+/g, "~");
 }

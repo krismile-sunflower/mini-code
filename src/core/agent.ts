@@ -1,14 +1,18 @@
 import { maybeCompactMessages } from "./compaction.js";
+import { renderCapabilityList, renderTable } from "./capabilities.js";
 import { parseDecision } from "./decision.js";
 import { DenialTracker } from "./denial.js";
 import { loadProjectMemory } from "./memory.js";
 import { fallbackReadFilePath, finalClaimsToolUse, requiresPlan, requiresWorkspaceTool } from "./policy.js";
 import { executePlanRequest, planModeRequest, planRequiredCorrection, planSystemPrompt, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
-import { discoverSkills, renderSkillList, skillInjection } from "./skills.js";
+import { defaultSkills, discoverSkills, renderSkillInspect, renderSkillList, resolveSkill, skillInjection } from "./skills.js";
 import { complete } from "../providers/llm.js";
 import { commandPrefix, commandPrefixApprovalKey } from "../tools/permissions.js";
 import { SessionStore } from "../storage/sessionStore.js";
-import { createTools } from "../tools/registry.js";
+import { createToolRegistry, createToolRegistryWithMcp } from "../tools/registry.js";
+import type { McpManager } from "../mcp/manager.js";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import type {
   AgentConfig,
   AgentDecision,
@@ -27,7 +31,8 @@ import type {
   ToolErrorType,
   ToolMetadata,
   ToolDefinition,
-  SkillInfo
+  SkillInfo,
+  CapabilityDescriptor
 } from "./types.js";
 
 function titleFromRequest(request: string): string {
@@ -61,14 +66,12 @@ function touchTask(task: TaskRecord): void {
   task.updatedAt = new Date().toISOString();
 }
 
-function selectToolsForPolicy(tools: ToolDefinition[], policy: AgentConfig["toolsPolicy"]): ToolDefinition[] {
-  if (policy === "read_only") return tools.filter((tool) => tool.risk === "read");
-  return tools;
-}
-
 export class AgentSession {
   readonly id: string;
   private readonly tools: Map<string, ToolDefinition>;
+  private readonly capabilities: CapabilityDescriptor[];
+  private readonly toolDescriptions: string;
+  private readonly mcpManager?: McpManager;
   private readonly sessionStore: SessionStore;
   private readonly approvalContext: ApprovalContext;
   private record!: SessionRecord;
@@ -77,6 +80,8 @@ export class AgentSession {
   private summary = "";
   private permissionMode: PermissionMode;
   private abortController: AbortController | null;
+  private activeSkills: string[] = [];
+  private readonly capabilityChangeSummary: string;
   private readonly denialTracker = new DenialTracker();
 
   abort(): void {
@@ -88,11 +93,18 @@ export class AgentSession {
     private readonly onEvent: AgentEventHandler,
     private readonly onApproval: ApprovalHandler,
     toolList: ToolDefinition[],
-    private readonly skills: SkillInfo[],
+    private skills: SkillInfo[],
+    capabilities: CapabilityDescriptor[],
+    toolDescriptions: string,
+    mcpManager: McpManager | undefined,
     record: SessionRecord
   ) {
     this.abortController = null;
     this.tools = new Map(toolList.map((tool) => [tool.name, tool]));
+    this.capabilities = capabilities;
+    this.toolDescriptions = toolDescriptions;
+    this.mcpManager = mcpManager;
+    this.capabilityChangeSummary = capabilityDiff(record.capabilities ?? [], capabilities);
     this.sessionStore = new SessionStore(config.sessionDir);
     this.approvalContext = {
       cwd: config.cwd,
@@ -112,8 +124,13 @@ export class AgentSession {
   }
 
   static async create(config: AgentConfig, onEvent: AgentEventHandler, onApproval: ApprovalHandler): Promise<AgentSession> {
-    const toolList = selectToolsForPolicy(createTools(config.cwd, config.maxToolOutputChars, config.allowDangerousCommands), config.toolsPolicy);
-    const skills = await discoverSkills(config.cwd, config.skills, config.enableSkills);
+    const { registry, mcpManager } = config.enableMcp === false
+      ? { registry: createToolRegistry(config.cwd, config.maxToolOutputChars, config.allowDangerousCommands), mcpManager: undefined }
+      : await createToolRegistryWithMcp(config.cwd, config.maxToolOutputChars, config.allowDangerousCommands, config.mcpConfigPath);
+    const toolList = registry.list(config.toolsPolicy);
+    const capabilities = registry.capabilities(config.toolsPolicy);
+    const toolDescriptions = registry.describeTools(config.toolsPolicy);
+    const skills = await discoverSkills(config.cwd, config.skills, config.enableSkills, { includeGlobal: config.includeGlobalSkills });
     const projectMemory = await loadProjectMemory(config.cwd);
     const store = new SessionStore(config.sessionDir);
     await store.ensure();
@@ -129,7 +146,7 @@ export class AgentSession {
         baseUrl: config.baseUrl,
         messages
       });
-    const session = new AgentSession(config, onEvent, onApproval, toolList, skills, record);
+    const session = new AgentSession(config, onEvent, onApproval, toolList, skills, capabilities, toolDescriptions, mcpManager, record);
     await session.persist();
     return session;
   }
@@ -165,7 +182,7 @@ export class AgentSession {
         return msg;
       }
       await this.compactIfNeeded();
-      const { raw, decision } = await this.nextDecision();
+      const { raw, decision } = await this.nextDecision({ allowMarkdownFinal: !mustUseTool && !mustPlan });
       if (mustPlan && !hasPlan && decision.action !== "plan") {
         if (planCorrections < 2) {
           planCorrections += 1;
@@ -527,42 +544,292 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   }
 
   getRecord(): SessionRecord {
-    return { ...this.record, messages: [...this.messages], events: [...this.events], tasks: [...(this.record.tasks ?? [])], plans: [...(this.record.plans ?? [])], summary: this.summary };
+    return { ...this.record, messages: [...this.messages], events: [...this.events], tasks: [...(this.record.tasks ?? [])], plans: [...(this.record.plans ?? [])], capabilities: [...this.capabilities], summary: this.summary };
   }
 
   describeTools(): string {
-    return Array.from(this.tools.values())
-      .map((tool) => `${tool.name} [${tool.risk}] ${tool.description}`)
-      .join("\n");
+    return this.toolDescriptions;
+  }
+
+  describeCapabilities(): string {
+    return renderCapabilityList(this.capabilities);
+  }
+
+  describeStatusExtras(): string {
+    const mcpServers = this.mcpManager?.names().join(", ") || "none";
+    const defaultSkillCount = defaultSkills(this.skills).length;
+    const shadowedSkillCount = this.skills.filter((skill) => skill.shadowedBy).length;
+    const features = this.config.featureFlags?.length ? this.config.featureFlags.join(", ") : "none";
+    return [
+      `skillsTotal=${this.skills.length}`,
+      `skillsDefault=${defaultSkillCount}`,
+      `skillsShadowed=${shadowedSkillCount}`,
+      `activeSkills=${this.activeSkills.join(", ") || "none"}`,
+      `mcpServers=${mcpServers}`,
+      `capabilities=${this.capabilities.length}`,
+      `toolProtocol=${this.config.toolProtocol ?? "json"}`,
+      `features=${features}`
+    ].join("\n");
+  }
+
+  describeStatus(): string {
+    const task = this.record.tasks?.at(-1);
+    const plan = this.record.plans?.at(-1);
+    const defaultSkillCount = defaultSkills(this.skills).length;
+    const shadowedSkillCount = this.skills.filter((skill) => skill.shadowedBy).length;
+    const mcpServers = this.mcpManager?.names() ?? [];
+    const rows = [
+      { field: "session", value: this.id },
+      { field: "cwd", value: this.config.cwd },
+      { field: "provider", value: this.config.provider },
+      { field: "model", value: this.config.model },
+      { field: "planModel", value: this.config.planModel },
+      { field: "permissionMode", value: this.permissionMode },
+      { field: "messages", value: String(this.messages.length) },
+      { field: "summary", value: this.summary ? "yes" : "no" },
+      { field: "task", value: task ? task.status : "none" },
+      { field: "toolCalls", value: String(task?.toolCalls.length ?? 0) },
+      { field: "lastError", value: task?.error ?? "none" },
+      { field: "plan", value: plan ? `${plan.id} ${plan.status}${plan.executedAt ? " executed" : ""}` : "none" },
+      { field: "skillsTotal", value: String(this.skills.length) },
+      { field: "skillsDefault", value: String(defaultSkillCount) },
+      { field: "skillsShadowed", value: String(shadowedSkillCount) },
+      { field: "activeSkills", value: this.activeSkills.join(", ") || "none" },
+      { field: "mcpServers", value: mcpServers.join(", ") || "none" },
+      { field: "capabilities", value: String(this.capabilities.length) },
+      { field: "toolProtocol", value: this.config.toolProtocol ?? "json" },
+      { field: "features", value: this.config.featureFlags?.join(", ") || "none" }
+    ];
+    return ["status:", renderTable(rows, [
+      { key: "field", width: 18, value: (item) => item.field },
+      { key: "value", width: 90, value: (item) => item.value }
+    ])].join("\n");
+  }
+
+  describeModel(): string {
+    return [
+      "model:",
+      renderTable([
+        { field: "provider", value: this.config.provider, source: this.config.configSources?.provider ?? "default" },
+        { field: "model", value: this.config.model, source: this.config.configSources?.model ?? "default" },
+        { field: "planModel", value: this.config.planModel, source: this.config.configSources?.planModel ?? "default" },
+        { field: "baseUrl", value: this.config.baseUrl, source: "config" },
+        { field: "toolProtocol", value: this.config.toolProtocol ?? "json", source: "config" }
+      ], [
+        { key: "field", width: 16, value: (item) => item.field },
+        { key: "value", width: 72, value: (item) => item.value },
+        { key: "source", width: 12, value: (item) => item.source }
+      ]),
+      "",
+      "Change the model by restarting with --model <name>, or set MINI_CODE_MODEL / OPENAI_MODEL / ANTHROPIC_MODEL."
+    ].join("\n");
+  }
+
+  describeConfig(): string {
+    const rows = [
+      { field: "cwd", value: this.config.cwd, source: "runtime" },
+      { field: "agentDir", value: this.config.agentDir, source: this.config.configSources?.agentDir ?? "default" },
+      { field: "sessionDir", value: this.config.sessionDir, source: this.config.configSources?.sessionDir ?? "default" },
+      { field: "provider", value: this.config.provider, source: this.config.configSources?.provider ?? "default" },
+      { field: "model", value: this.config.model, source: this.config.configSources?.model ?? "default" },
+      { field: "planModel", value: this.config.planModel, source: this.config.configSources?.planModel ?? "default" },
+      { field: "permissionMode", value: this.permissionMode, source: this.config.configSources?.permissionMode ?? "default" },
+      { field: "toolsPolicy", value: this.config.toolsPolicy, source: this.config.configSources?.toolsPolicy ?? "default" },
+      { field: "toolProtocol", value: this.config.toolProtocol ?? "json", source: "config" },
+      { field: "enableSkills", value: String(this.config.enableSkills), source: "config" },
+      { field: "includeGlobalSkills", value: String(this.config.includeGlobalSkills !== false), source: "config" },
+      { field: "enableSkillHelpers", value: String(this.config.enableSkillHelpers !== false), source: "config" },
+      { field: "enableMcp", value: String(this.config.enableMcp !== false), source: "config" },
+      { field: "mcpConfigPath", value: this.mcpConfigPath(), source: "config" },
+      { field: "features", value: this.config.featureFlags?.join(", ") || "none", source: "config" }
+    ];
+    return ["config:", renderTable(rows, [
+      { key: "field", width: 22, value: (item) => item.field },
+      { key: "value", width: 88, value: (item) => item.value },
+      { key: "source", width: 12, value: (item) => item.source }
+    ])].join("\n");
+  }
+
+  describeFeatures(): string {
+    const flags = this.config.featureFlags ?? [];
+    return [
+      flags.length ? "Enabled feature flags:" : "No feature flags enabled.",
+      ...flags.map((flag) => `- ${flag}`),
+      "",
+      "Enable experimental flags with FEATURE_<NAME>=1, for example FEATURE_BUDDY=1."
+    ].filter((line, index) => flags.length > 0 || index !== 1).join("\n");
+  }
+
+  describeLogin(): string {
+    return [
+      "Mini Code authentication is env/config based in this release.",
+      "",
+      "OpenAI:",
+      "  OPENAI_API_KEY=sk-...",
+      "  MINI_CODE_PROVIDER=openai",
+      "  MINI_CODE_MODEL=gpt-4.1-mini",
+      "",
+      "Anthropic:",
+      "  ANTHROPIC_API_KEY=sk-ant-...",
+      "  MINI_CODE_PROVIDER=anthropic",
+      "  MINI_CODE_MODEL=claude-sonnet-4-20250514",
+      "",
+      "Project config lives at .mini-code/config.json. Secrets should stay in .env.local or your shell environment."
+    ].join("\n");
+  }
+
+  describeDoctor(): string {
+    const checks: Array<{ label: string; ok: boolean; detail: string }> = [
+      { label: "apiKey", ok: Boolean(this.config.apiKey), detail: this.config.apiKey ? "configured" : "missing" },
+      { label: "baseUrl", ok: /^https?:\/\//.test(this.config.baseUrl), detail: this.config.baseUrl },
+      { label: "provider", ok: this.config.provider === "openai" || this.config.provider === "anthropic", detail: this.config.provider },
+      { label: "model", ok: Boolean(this.config.model), detail: this.config.model || "missing" },
+      { label: "sessionDir", ok: Boolean(this.config.sessionDir), detail: this.config.sessionDir },
+      { label: "mcpConfig", ok: this.config.enableMcp === false || existsSync(this.mcpConfigPath()) || !this.config.mcpConfigPath, detail: this.config.enableMcp === false ? "disabled" : this.mcpConfigPath() },
+      { label: "skills", ok: this.config.enableSkills === false || this.skills.length > 0 || this.config.skills.length === 0, detail: this.config.enableSkills === false ? "disabled" : `${this.skills.length} discovered` },
+      { label: "toolProtocol", ok: this.config.toolProtocol === undefined || this.config.toolProtocol === "json" || this.config.toolProtocol === "native", detail: this.config.toolProtocol ?? "json" }
+    ];
+    const warnings = checks.filter((check) => !check.ok).length;
+    return [
+      `doctor: ${warnings === 0 ? "ok" : `${warnings} warning${warnings === 1 ? "" : "s"}`}`,
+      renderTable(checks, [
+        { key: "status", width: 8, value: (item) => item.ok ? "ok" : "warn" },
+        { key: "check", width: 18, value: (item) => item.label },
+        { key: "detail", width: 90, value: (item) => item.detail }
+      ])
+    ].join("\n");
+  }
+
+  getCapabilityChangeSummary(): string {
+    return this.capabilityChangeSummary;
+  }
+
+  async describeMcp(kind: "servers" | "tools" | "resources" | "prompts" = "servers"): Promise<string> {
+    if (!this.mcpManager) return "MCP is not configured.";
+    if (kind === "servers") {
+      const servers = this.mcpManager.serverStatuses();
+      if (servers.length === 0) return "[no MCP servers]";
+      return [
+        `mcp servers: total=${servers.length}`,
+        renderTable(servers, [
+          { key: "server", width: 20, value: (item) => item.name },
+          { key: "status", width: 12, value: (item) => item.status },
+          { key: "risk", width: 9, value: (item) => item.risk },
+          { key: "command", width: 28, value: (item) => item.command },
+          { key: "args", width: 44, value: (item) => item.args.join(" ") || "[none]" }
+        ])
+      ].join("\n");
+    }
+    if (kind === "resources") {
+      const resources = await this.mcpManager.listResources();
+      if (resources.length === 0) return "[no MCP resources]";
+      return [
+        `mcp resources: total=${resources.length}`,
+        renderTable(resources, [
+          { key: "server", width: 20, value: (item) => item.server },
+          { key: "uri", width: 48, value: (item) => item.uri },
+          { key: "name", width: 24, value: (item) => item.name ?? "" },
+          { key: "description", width: 80, value: (item) => item.description ?? "" }
+        ])
+      ].join("\n");
+    }
+    if (kind === "prompts") {
+      const prompts = await this.mcpManager.listPrompts();
+      if (prompts.length === 0) return "[no MCP prompts]";
+      return [
+        `mcp prompts: total=${prompts.length}`,
+        renderTable(prompts, [
+          { key: "server", width: 20, value: (item) => item.server },
+          { key: "name", width: 28, value: (item) => item.name },
+          { key: "description", width: 80, value: (item) => item.description ?? "" }
+        ])
+      ].join("\n");
+    }
+    return renderCapabilityList(this.capabilities.filter((item) => item.kind === "mcp_tool"), "mcp tools");
+  }
+
+  reconnectMcp(server: string): string {
+    if (!this.mcpManager) return "MCP is not configured.";
+    this.mcpManager.reconnect(server);
+    return `Reconnected MCP server ${server}.`;
+  }
+
+  private mcpConfigPath(): string {
+    return this.config.mcpConfigPath ? path.resolve(this.config.cwd, this.config.mcpConfigPath) : path.join(this.config.cwd, ".mini-code", "mcp.json");
   }
 
   describePermissions(): string {
     const remembered = Array.from(this.approvalContext.allowedApprovalKeys).filter((key) => !key.startsWith("mode:")).sort();
     const prefixes = Array.from(this.approvalContext.allowedCommandPrefixes).sort();
-    return [
-      "read: allowed",
-      this.permissionMode === "accept_edits" || this.permissionMode === "bypass_permissions"
-        ? "ordinary write: allowed; sensitive/delete/unusual writes require approval"
-        : "ordinary write: ask; sensitive/delete/unusual writes require approval",
-      "shell: ask; dangerous commands blocked unless --allow-dangerous",
-      this.permissionMode === "bypass_permissions" ? "bypass permissions: non-dangerous shell is allowed" : `permission mode: ${this.permissionMode}`,
-      remembered.length ? `remembered approvals:\n${remembered.join("\n")}` : "remembered approvals: none",
-      prefixes.length ? `remembered command prefixes:\n${prefixes.join("\n")}` : "remembered command prefixes: none"
-    ].join("\n");
+    const rows = [
+      { scope: "read", decision: "allowed", detail: "Read-only tools do not require approval." },
+      {
+        scope: "ordinary write",
+        decision: this.permissionMode === "accept_edits" || this.permissionMode === "bypass_permissions" ? "allowed" : "ask",
+        detail: "Sensitive, delete, and unusual writes still require approval."
+      },
+      { scope: "shell", decision: this.permissionMode === "bypass_permissions" ? "allowed" : "ask", detail: "Dangerous commands are blocked unless --allow-dangerous is set." },
+      { scope: "mode", decision: this.permissionMode, detail: this.permissionMode === "bypass_permissions" ? "Non-dangerous shell may run without prompting." : "Permission mode controls default approval behavior." },
+      { scope: "remembered approvals", decision: String(remembered.length), detail: remembered.join(", ") || "none" },
+      { scope: "remembered prefixes", decision: String(prefixes.length), detail: prefixes.join(", ") || "none" }
+    ];
+    return ["permissions:", renderTable(rows, [
+      { key: "scope", width: 22, value: (item) => item.scope },
+      { key: "decision", width: 18, value: (item) => item.decision },
+      { key: "detail", width: 90, value: (item) => item.detail }
+    ])].join("\n");
   }
 
   describeSkills(): string {
     return renderSkillList(this.skills);
   }
 
-  async useSkill(name: string, args: string): Promise<string> {
-    const normalized = name.toLowerCase();
-    const skill = this.skills.find((item) => item.name === normalized || item.name.startsWith(normalized));
-    if (!skill) throw new Error(`Skill not found: ${name}`);
+  getSkills(): SkillInfo[] {
+    return [...this.skills];
+  }
+
+  inspectSkill(nameOrId: string): string {
+    const { skill, candidates } = resolveSkill(this.skills, nameOrId);
+    if (!skill) throw new Error(`Skill not found: ${nameOrId}`);
+    return renderSkillInspect(skill, candidates);
+  }
+
+  async reloadSkills(): Promise<string> {
+    const before = this.skills;
+    const after = await discoverSkills(this.config.cwd, this.config.skills, this.config.enableSkills, { includeGlobal: this.config.includeGlobalSkills });
+    this.skills = after;
+    const beforeIds = new Set(before.map((skill) => skill.id));
+    const afterIds = new Set(after.map((skill) => skill.id));
+    const added = after.filter((skill) => !beforeIds.has(skill.id)).map((skill) => skill.id).sort();
+    const removed = before.filter((skill) => !afterIds.has(skill.id)).map((skill) => skill.id).sort();
+    this.messages.push({
+      role: "user",
+      content: [
+        `Skills reloaded: before=${before.length} after=${after.length}.`,
+        added.length ? `Added skills: ${added.join(", ")}` : undefined,
+        removed.length ? `Removed skills: ${removed.join(", ")}` : undefined
+      ].filter(Boolean).join("\n")
+    });
+    await this.persist();
+    return [
+      `Reloaded skills: before=${before.length} after=${after.length}`,
+      `defaults=${defaultSkills(after).length} shadowed=${after.filter((skill) => skill.shadowedBy).length}`,
+      added.length ? `added: ${added.join(", ")}` : "added: none",
+      removed.length ? `removed: ${removed.join(", ")}` : "removed: none"
+    ].join("\n");
+  }
+
+  async useSkill(nameOrId: string, args: string): Promise<string> {
+    const { skill, candidates } = resolveSkill(this.skills, nameOrId);
+    if (!skill) throw new Error(`Skill not found: ${nameOrId}`);
     const content = skillInjection(skill, args);
     this.messages.push({ role: "user", content });
+    if (!this.activeSkills.includes(skill.id)) this.activeSkills.push(skill.id);
     await this.persist();
-    return `Loaded skill ${skill.name}.`;
+    const duplicateNote = candidates.length > 1 && !nameOrId.includes(":")
+      ? `\nResolved duplicate name "${skill.name}" to default id ${skill.id}. Use /skill:<id> for an exact match.`
+      : "";
+    return `Loaded skill ${skill.name} (${skill.id}).${duplicateNote}`;
   }
 
   setPermissionMode(mode: PermissionMode): void {
@@ -582,11 +849,14 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
     if (mode === "bypass_permissions") this.approvalContext.allowedApprovalKeys.add("mode:bypass_permissions");
   }
 
-  private async nextDecision(): Promise<{ raw: string; decision: AgentDecision }> {
+  private async nextDecision(options: { allowMarkdownFinal?: boolean } = {}): Promise<{ raw: string; decision: AgentDecision }> {
     let raw = await this.callModel();
     try {
       return { raw, decision: parseDecision(raw, this.tools) };
     } catch (error) {
+      if (options.allowMarkdownFinal && isDisplayMarkdownFinal(raw)) {
+        return { raw, decision: { action: "final", answer: raw.trim() } };
+      }
       await this.emit({ type: "error", category: "parse", error: error instanceof Error ? error.message : String(error) });
       this.messages.push(repairPrompt(error, raw));
       await this.persist();
@@ -594,6 +864,9 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       try {
         return { raw, decision: parseDecision(raw, this.tools) };
       } catch (secondError) {
+        if (options.allowMarkdownFinal && isDisplayMarkdownFinal(raw)) {
+          return { raw, decision: { action: "final", answer: raw.trim() } };
+        }
         const message = secondError instanceof Error ? secondError.message : String(secondError);
         await this.emit({ type: "error", category: "parse", error: message });
         throw secondError;
@@ -610,6 +883,8 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
         apiKey: this.config.apiKey,
         model: this.config.model,
         messages: this.messages,
+        toolProtocol: this.config.toolProtocol,
+        tools: Array.from(this.tools.values()),
         signal: this.abortController?.signal ?? undefined,
         onDelta: (text) => { void this.onEvent({ type: "model_stream_delta", text }); }
       });
@@ -683,6 +958,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       events: this.events,
       tasks: this.record.tasks ?? [],
       plans: this.record.plans ?? [],
+      capabilities: this.capabilities,
       summary: this.summary
     };
     await this.sessionStore.save(this.record);
@@ -805,4 +1081,29 @@ function approvalMetadata(requirement: import("./types.js").ApprovalRequirement)
     blocked: requirement.blocked,
     rememberable: requirement.rememberable
   };
+}
+
+function looksJsonLike(value: string): boolean {
+  return /^\s*[{[]/.test(value);
+}
+
+function isDisplayMarkdownFinal(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed || looksJsonLike(trimmed)) return false;
+  if (/^(not json|invalid json|error)$/i.test(trimmed)) return false;
+  return /[.!?。？！]$/.test(trimmed) || /[\u4e00-\u9fff]/.test(trimmed) || /^#{1,6}\s+\S/m.test(trimmed) || /^[-*]\s+\S/m.test(trimmed) || trimmed.length > 20;
+}
+
+function capabilityDiff(previous: CapabilityDescriptor[], current: CapabilityDescriptor[]): string {
+  if (previous.length === 0) return "";
+  const previousIds = new Set(previous.map((item) => item.id));
+  const currentIds = new Set(current.map((item) => item.id));
+  const added = current.filter((item) => !previousIds.has(item.id)).map((item) => item.id).sort();
+  const removed = previous.filter((item) => !currentIds.has(item.id)).map((item) => item.id).sort();
+  if (added.length === 0 && removed.length === 0) return "";
+  return [
+    "Capability snapshot changed since this session was saved.",
+    added.length ? `added: ${added.join(", ")}` : undefined,
+    removed.length ? `removed: ${removed.join(", ")}` : undefined
+  ].filter(Boolean).join("\n");
 }

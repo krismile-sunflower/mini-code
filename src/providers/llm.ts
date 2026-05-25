@@ -1,4 +1,4 @@
-import type { LlmProvider, Message, ModelResponse, ModelStreamEvent } from "../core/types.js";
+import type { LlmProvider, Message, ModelResponse, ModelStreamEvent, ToolDefinition, ToolProtocol } from "../core/types.js";
 
 export interface ChatOptions {
   provider: LlmProvider;
@@ -11,6 +11,8 @@ export interface ChatOptions {
   signal?: AbortSignal;
   /** Called for each text token as it streams in */
   onDelta?: (text: string) => void;
+  toolProtocol?: ToolProtocol;
+  tools?: ToolDefinition[];
 }
 
 export async function complete(options: ChatOptions): Promise<ModelResponse> {
@@ -36,13 +38,30 @@ async function openAIComplete(options: ChatOptions): Promise<ModelResponse> {
       model: options.model,
       messages,
       temperature: options.temperature ?? 0.2,
-      stream: true
+      stream: options.toolProtocol === "native" ? false : true,
+      ...(options.toolProtocol === "native" ? { tools: toOpenAITools(options.tools ?? []) } : {})
     })
   });
 
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as { error?: { message?: string } };
     throw new Error(body.error?.message ?? `OpenAI request failed: ${response.status}`);
+  }
+  if (!isEventStream(response)) {
+    const body = (await response.json()) as { choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> } }> };
+    const toolCall = body.choices?.[0]?.message?.tool_calls?.[0];
+    if (toolCall?.function?.name) {
+      const content = JSON.stringify({
+        action: "tool",
+        tool: toolCall.function.name,
+        input: parseJsonObject(toolCall.function.arguments),
+        thought: "Provider returned a native tool call."
+      });
+      return { provider: options.provider, model: options.model, raw: content, content, streamEvents: [{ type: "tool_call_delta", text: content }] };
+    }
+    const content = body.choices?.[0]?.message?.content;
+    if (!content) throw new Error("OpenAI response did not include message content.");
+    return { provider: options.provider, model: options.model, raw: content, content, streamEvents: [] };
   }
   if (!response.body) throw new Error("OpenAI response body is empty.");
 
@@ -103,13 +122,30 @@ async function anthropicComplete(options: ChatOptions): Promise<ModelResponse> {
       temperature: options.temperature ?? 0.2,
       system: system || undefined,
       messages,
-      stream: true
+      stream: options.toolProtocol === "native" ? false : true,
+      ...(options.toolProtocol === "native" ? { tools: toAnthropicTools(options.tools ?? []) } : {})
     })
   });
 
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as { error?: { message?: string } };
     throw new Error(body.error?.message ?? `Anthropic request failed: ${response.status}`);
+  }
+  if (!isEventStream(response)) {
+    const body = (await response.json()) as { content?: Array<{ type?: string; text?: string; name?: string; input?: Record<string, unknown> }> };
+    const toolUse = body.content?.find((part) => part.type === "tool_use" && typeof part.name === "string");
+    if (toolUse?.name) {
+      const content = JSON.stringify({
+        action: "tool",
+        tool: toolUse.name,
+        input: typeof toolUse.input === "object" && toolUse.input !== null ? toolUse.input : {},
+        thought: "Provider returned a native tool call."
+      });
+      return { provider: options.provider, model: options.model, raw: content, content, streamEvents: [{ type: "tool_call_delta", text: content }] };
+    }
+    const content = body.content?.filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("") ?? "";
+    if (!content) throw new Error("Anthropic response did not include text content.");
+    return { provider: options.provider, model: options.model, raw: content, content, streamEvents: [] };
   }
   if (!response.body) throw new Error("Anthropic response body is empty.");
 
@@ -158,6 +194,47 @@ async function anthropicComplete(options: ChatOptions): Promise<ModelResponse> {
 
   if (!content) throw new Error("Anthropic response did not include text content.");
   return { provider: options.provider, model: options.model, raw: content, content, streamEvents };
+}
+
+function toOpenAITools(tools: ToolDefinition[]): Array<{ type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } }> {
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: toolSchema(tool)
+    }
+  }));
+}
+
+function toAnthropicTools(tools: ToolDefinition[]): Array<{ name: string; description: string; input_schema: Record<string, unknown> }> {
+  return tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    input_schema: toolSchema(tool)
+  }));
+}
+
+function toolSchema(tool: ToolDefinition): Record<string, unknown> {
+  const properties: Record<string, unknown> = {};
+  for (const [key, description] of Object.entries(tool.inputSchema)) {
+    properties[key] = { type: "string", description };
+  }
+  return { type: "object", properties };
+}
+
+function parseJsonObject(value: string | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function isEventStream(response: Response): boolean {
+  return response.headers.get("content-type")?.toLowerCase().includes("text/event-stream") ?? false;
 }
 
 export function toProviderMessages(messages: Message[]): Array<{ role: "system" | "user" | "assistant"; content: string }> {

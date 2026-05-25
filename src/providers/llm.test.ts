@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chat, complete, toProviderMessages } from "./llm.js";
+import type { ToolDefinition } from "../core/types.js";
 
 test("chat sends OpenAI-compatible chat completions request", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -84,6 +85,39 @@ test("toProviderMessages merges tool result without call ids", () => {
   assert.match(messages[1]?.content ?? "", /Tool result for read_file/);
 });
 
+test("OpenAI native tool calls normalize to JSON tool decisions", async () => {
+  const calls: Array<{ body: unknown }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return jsonResponse({
+      choices: [{
+        message: {
+          tool_calls: [{ function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" } }]
+        }
+      }]
+    });
+  };
+  try {
+    const result = await complete({
+      provider: "openai",
+      baseUrl: "https://api.openai.test/v1",
+      apiKey: "key",
+      model: "model",
+      messages: [{ role: "user", content: "read README.md" }],
+      toolProtocol: "native",
+      tools: [fakeTool("read_file")]
+    });
+    assert.equal(JSON.parse(result.content).tool, "read_file");
+    assert.deepEqual(JSON.parse(result.content).input, { path: "README.md" });
+    const body = calls[0]?.body as { tools?: unknown[]; stream?: boolean };
+    assert.equal(body.stream, false);
+    assert.equal(Array.isArray(body.tools), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("chat sends Anthropic messages request and converts system/tool roles", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const originalFetch = globalThis.fetch;
@@ -138,9 +172,49 @@ test("complete normalizes Anthropic responses", async () => {
   }
 });
 
+test("Anthropic native tool calls normalize to JSON tool decisions", async () => {
+  const calls: Array<{ body: unknown }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return jsonResponse({ content: [{ type: "tool_use", name: "read_file", input: { path: "README.md" } }] });
+  };
+  try {
+    const result = await complete({
+      provider: "anthropic",
+      baseUrl: "https://api.anthropic.test/v1",
+      apiKey: "ant-key",
+      model: "claude",
+      messages: [{ role: "user", content: "read README.md" }],
+      toolProtocol: "native",
+      tools: [fakeTool("read_file")]
+    });
+    assert.equal(JSON.parse(result.content).tool, "read_file");
+    assert.deepEqual(JSON.parse(result.content).input, { path: "README.md" });
+    const body = calls[0]?.body as { tools?: unknown[]; stream?: boolean };
+    assert.equal(body.stream, false);
+    assert.equal(Array.isArray(body.tools), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" }
   });
+}
+
+function fakeTool(name: string): ToolDefinition {
+  return {
+    name,
+    description: `${name} description`,
+    inputSchema: { path: "Path to read." },
+    risk: "read",
+    describe: () => name,
+    validate: () => undefined,
+    requiresApproval: () => ({ required: false, risk: "read", reason: "ok" }),
+    run: async () => ({ ok: true, output: "ok" })
+  };
 }

@@ -14,6 +14,16 @@ test("parseDecision accepts fenced JSON", () => {
   assert.equal(decision.answer, "done");
 });
 
+test("parseDecision accepts answer shorthand and ignores trailing text", () => {
+  const shorthand = parseDecision('{"answer":"你好，有什么可以帮你的？"}');
+  assert.equal(shorthand.action, "final");
+  assert.equal(shorthand.answer, "你好，有什么可以帮你的？");
+
+  const trailed = parseDecision('{"action":"final","answer":"done"}\nextra markdown');
+  assert.equal(trailed.action, "final");
+  assert.equal(trailed.answer, "done");
+});
+
 test("parseDecision validates final answer", () => {
   assert.throws(() => parseDecision('{"action":"final"}'), /answer/);
 });
@@ -414,6 +424,122 @@ test("AgentSession read-only tools policy removes write and shell tools", async 
   }
 });
 
+test("AgentSession treats plain markdown as final for ordinary questions", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-markdown-final-"));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: "你好！有什么可以帮你的？" } }] });
+  const events: AgentEvent[] = [];
+  try {
+    const session = await AgentSession.create(config(dir), (event) => events.push(event), async () => "allow_once");
+    const answer = await session.run("你好");
+    assert.equal(answer, "你好！有什么可以帮你的？");
+    assert.equal(events.some((event) => event.type === "error" && event.category === "parse"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession still repairs plain markdown when workspace tools are required", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-markdown-tool-required-"));
+  await writeFile(path.join(dir, "package.json"), "{\"name\":\"mini\"}\n", "utf8");
+  const originalFetch = globalThis.fetch;
+  const responses = [
+    "package.json 里有 name 字段。",
+    '{"action":"tool","tool":"read_file","input":{"path":"package.json"}}',
+    '{"answer":"package.json 里 name 是 mini。"}'
+  ];
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: responses.shift() } }] });
+  const events: AgentEvent[] = [];
+  try {
+    const session = await AgentSession.create(config(dir, { maxTurns: 5 }), (event) => events.push(event), async () => "allow_once");
+    const answer = await session.run("package.json文件里面有什么");
+    assert.equal(answer, "package.json 里 name 是 mini。");
+    assert.ok(events.some((event) => event.type === "error" && event.category === "parse"));
+    assert.ok(events.some((event) => event.type === "tool_request" && event.tool === "read_file"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession records capability snapshot and exposes source-labelled tools", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-capabilities-"));
+  try {
+    const session = await AgentSession.create(config(dir, { toolsPolicy: "read_only" }), () => undefined, async () => "allow_once");
+    const record = session.getRecord();
+    assert.ok(record.capabilities?.some((capability) => capability.id === "builtin:read_file"));
+    assert.match(session.describeTools(), /source=builtin/);
+    assert.match(session.describeCapabilities(), /builtin:read_file/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession exposes model config doctor features and login guidance", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-describe-config-"));
+  try {
+    const session = await AgentSession.create(config(dir, { apiKey: "", featureFlags: ["buddy", "remote-monitor"] }), () => undefined, async () => "allow_once");
+
+    assert.match(session.describeModel(), /model\s+test-model/);
+    assert.match(session.describeModel(), /field\s+value\s+source/);
+    assert.match(session.describeConfig(), /features\s+buddy, remote-monitor/);
+    assert.match(session.describeConfig(), /field\s+value\s+source/);
+    assert.match(session.describeFeatures(), /buddy/);
+    assert.match(session.describeDoctor(), /status\s+check\s+detail/);
+    assert.match(session.describeDoctor(), /warn\s+apiKey\s+missing/);
+    assert.match(session.describeLogin(), /OPENAI_API_KEY/);
+    assert.match(session.describePermissions(), /scope\s+decision\s+detail/);
+    assert.match(session.describePermissions(), /ordinary write\s+ask/);
+    assert.match(session.describeStatusExtras(), /features=buddy, remote-monitor/);
+    assert.match(session.describeStatus(), /field\s+value/);
+    assert.match(session.describeStatus(), /skillsTotal/);
+    assert.match(session.describeStatus(), /toolProtocol/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession reports capability changes when resuming", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-capability-diff-"));
+  try {
+    const first = await AgentSession.create(config(dir, { enableMcp: false }), () => undefined, async () => "allow_once");
+    const record = first.getRecord();
+    record.capabilities = [{ id: "missing:old", kind: "mcp_tool", name: "old", description: "old", risk: "read", source: "mcp:old" }];
+    await new (await import("../storage/sessionStore.js")).SessionStore(path.join(dir, ".mini-code", "sessions")).save(record);
+
+    const resumed = await AgentSession.create(config(dir, { sessionId: record.id, enableMcp: false }), () => undefined, async () => "allow_once");
+
+    assert.match(resumed.getCapabilityChangeSummary(), /Capability snapshot changed/);
+    assert.match(resumed.getCapabilityChangeSummary(), /removed: missing:old/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession can use provider native tool protocol", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-native-tools-"));
+  await writeFile(path.join(dir, "README.md"), "native tool content\n", "utf8");
+  const originalFetch = globalThis.fetch;
+  const responses = [
+    { choices: [{ message: { tool_calls: [{ function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" } }] } }] },
+    { choices: [{ message: { content: "{\"action\":\"final\",\"answer\":\"README.md contains native tool content.\"}" } }] }
+  ];
+  globalThis.fetch = async () => new Response(JSON.stringify(responses.shift()), {
+    status: 200,
+    headers: { "content-type": "application/json" }
+  });
+  try {
+    const session = await AgentSession.create(config(dir, { toolProtocol: "native", maxTurns: 4 }), () => undefined, async () => "allow_once");
+    const answer = await session.run("read README.md");
+    assert.equal(answer, "README.md contains native tool content.");
+    assert.equal(session.getRecord().tasks?.at(-1)?.toolCalls[0]?.tool, "read_file");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("AgentSession createPlan does not execute write tools", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-no-write-"));
   const file = path.join(dir, "note.txt");
@@ -467,6 +593,7 @@ function config(dir: string, overrides: Partial<AgentConfig> = {}): AgentConfig 
     toolsPolicy: "default",
     skills: [],
     enableSkills: true,
+    includeGlobalSkills: false,
     maxContextMessages: 40,
     maxToolOutputChars: 12_000,
     plain: false,

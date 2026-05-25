@@ -14,12 +14,11 @@ export function parseDecision(raw: string, tools?: Map<string, ToolDefinition>):
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
-  const firstBrace = withoutFence.indexOf("{");
-  const lastBrace = withoutFence.lastIndexOf("}");
-  if (firstBrace === -1 || lastBrace === -1) {
+  const jsonText = firstJsonObject(withoutFence);
+  if (!jsonText) {
     throw new Error(`Model did not return JSON: ${raw}`);
   }
-  const parsed = JSON.parse(withoutFence.slice(firstBrace, lastBrace + 1)) as unknown;
+  const parsed = normalizeDecisionObject(JSON.parse(jsonText) as unknown);
   if (!isPlainObject(parsed)) throw new Error("Model decision must be a JSON object.");
   if (parsed.action !== "plan" && parsed.action !== "tool" && parsed.action !== "final") {
     throw new Error(`Invalid action: ${String(parsed.action)}`);
@@ -36,6 +35,47 @@ export function parseDecision(raw: string, tools?: Map<string, ToolDefinition>):
     throw new Error("Final decision omitted string answer.");
   }
   return parsed as unknown as AgentDecision;
+}
+
+function normalizeDecisionObject(parsed: unknown): unknown {
+  if (!isPlainObject(parsed)) return parsed;
+  if (parsed.action === undefined && typeof parsed.answer === "string") {
+    return { ...parsed, action: "final" };
+  }
+  return parsed;
+}
+
+function firstJsonObject(value: string): string | undefined {
+  const start = value.indexOf("{");
+  if (start === -1) return undefined;
+  let depth = 0;
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+  for (let index = start; index < value.length; index += 1) {
+    const char = value[index] ?? "";
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      inString = true;
+      quote = char;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return value.slice(start, index + 1);
+    }
+  }
+  return undefined;
 }
 
 function validatePlanDecision(parsed: Record<string, unknown>): void {

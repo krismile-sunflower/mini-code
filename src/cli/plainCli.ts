@@ -3,6 +3,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { AgentSession } from "../core/agent.js";
 import { loadProjectMemory } from "../core/memory.js";
 import { SessionStore } from "../storage/sessionStore.js";
+import { renderCommandHelp } from "../ui/renderModel.js";
 import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval, PlanRecord } from "../core/types.js";
 import type { CliArgs } from "./config.js";
 
@@ -39,7 +40,7 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       continue;
     }
     if (request === "/help") {
-      output.write("/plan <request> /execute <plan-id> /memory /skills /skill:<name> <args> /sessions /new /resume <id> /rename <title> /export-session <path> /compact /summary /status /tools /permissions /exit\n");
+      output.write(`${renderCommandHelp()}\n`);
       continue;
     }
     if (request === "/memory") {
@@ -58,14 +59,55 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       continue;
     }
     if (request === "/status") {
-      const record = session.getRecord();
-      const task = record.tasks?.at(-1);
-      const plan = record.plans?.at(-1);
-      output.write(`session=${session.id}\nmessages=${session.getMessageCount()}\nsummary=${session.getSummary() ? "yes" : "no"}\ntask=${task?.status ?? "none"}\ntools=${task?.toolCalls.length ?? 0}\nplan=${plan ? `${plan.id} ${plan.status} ${plan.model}${plan.executedAt ? " executed" : ""}` : "none"}\n`);
+      output.write(`${session.describeStatus()}\n`);
+      continue;
+    }
+    if (request === "/model") {
+      output.write(`${session.describeModel()}\n`);
+      continue;
+    }
+    if (request === "/config") {
+      output.write(`${session.describeConfig()}\n`);
+      continue;
+    }
+    if (request === "/doctor") {
+      output.write(`${session.describeDoctor()}\n`);
+      continue;
+    }
+    if (request === "/features") {
+      output.write(`${session.describeFeatures()}\n`);
+      continue;
+    }
+    if (request === "/login") {
+      output.write(`${session.describeLogin()}\n`);
       continue;
     }
     if (request === "/tools") {
       output.write(`${session.describeTools()}\n`);
+      continue;
+    }
+    if (request === "/capabilities") {
+      output.write(`${session.describeCapabilities()}\n`);
+      continue;
+    }
+    if (request === "/mcp") {
+      output.write(`${await session.describeMcp("servers")}\n`);
+      continue;
+    }
+    if (request === "/mcp tools") {
+      output.write(`${await session.describeMcp("tools")}\n`);
+      continue;
+    }
+    if (request === "/mcp resources") {
+      output.write(`${await session.describeMcp("resources")}\n`);
+      continue;
+    }
+    if (request === "/mcp prompts") {
+      output.write(`${await session.describeMcp("prompts")}\n`);
+      continue;
+    }
+    if (request.startsWith("/mcp reconnect ")) {
+      output.write(`${session.reconnectMcp(request.slice("/mcp reconnect ".length).trim())}\n`);
       continue;
     }
     if (request === "/permissions") {
@@ -74,6 +116,14 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
     }
     if (request === "/skills") {
       output.write(`${session.describeSkills()}\n`);
+      continue;
+    }
+    if (request.startsWith("/skill inspect ")) {
+      output.write(`${session.inspectSkill(request.slice("/skill inspect ".length).trim())}\n`);
+      continue;
+    }
+    if (request === "/skill reload") {
+      output.write(`${await session.reloadSkills()}\n`);
       continue;
     }
     if (request.startsWith("/skill:")) {
@@ -122,6 +172,8 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       currentConfig = { ...currentConfig, sessionId: id };
       session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
       output.write(`resumed session: ${session.id}\n`);
+      const capabilityChange = session.getCapabilityChangeSummary();
+      if (capabilityChange) output.write(`${capabilityChange}\n`);
       continue;
     }
 

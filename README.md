@@ -39,6 +39,7 @@ Useful Mini Code capabilities:
 | Select model | `npm run dev -- --model gpt-4o` |
 | Select plan model | `npm run dev -- --plan-model claude-sonnet-4-5` |
 | Permission mode | `npm run dev -- --permission-mode accept_edits` |
+| Native provider tools | `npm run dev -- --tool-protocol native` |
 | Create plan | `npm run dev -- --plain --plan "design the refactor"` |
 | Execute saved plan | `npm run dev -- --plain --execute-plan <plan-id>` |
 | Pi pass-through | `npm run dev -- --pi-pass-through -- --help` |
@@ -82,10 +83,22 @@ Mini Shell provides Claude-Code-like workflows through slash commands and hotkey
 | --- | --- |
 | `/help` | Show Mini Code commands. |
 | `/status` | Show effective session/config status. |
+| `/model` | Show active provider, model, plan model, base URL, and tool protocol. |
+| `/config` | Show resolved Mini Code configuration and config sources. |
+| `/doctor` | Run local provider/config/MCP/skills diagnostics. |
+| `/features` | Show enabled `FEATURE_*` flags. |
+| `/login` | Show provider authentication setup guidance. |
 | `/tools` | Show built-in workspace tools. |
 | `/permissions` | Show permission mode and remembered approvals. |
-| `/skills` | Show discovered Mini Code skills. |
-| `/skill:<name> <args>` | Load one skill into the next model turn. |
+| `/skills` | Show every discovered skill with stable id, source, status, description, and path. |
+| `/skill inspect <name-or-id>` | Show a skill manifest; duplicate names show all candidates and the default. |
+| `/skill reload` | Rediscover skills and refresh the session/TUI skill list without restarting. |
+| `/skill:<name-or-id> <args>` | Load the default skill for a name, or an exact skill by id. |
+| `/mcp` | Show configured MCP servers. |
+| `/mcp tools` | Show tools exposed by configured MCP servers. |
+| `/mcp resources` | Show resources exposed by configured MCP servers. |
+| `/mcp reconnect <server>` | Restart one MCP server connection. |
+| `/capabilities` | Show the unified capability snapshot. |
 | `/plan <request>` | Create a read-only implementation plan. |
 | `/execute <plan-id>` | Execute an approved/saved plan. |
 | `/resume` | Resume a previous session. |
@@ -107,6 +120,20 @@ Important Mini Shell hotkeys:
 | `Ctrl+C` | Exit. |
 
 Mini Code implements its own permission prompts for write, patch, shell, sensitive paths, deletes, and dangerous commands.
+
+### Config And Diagnostics
+
+Mini Code exposes Claude-Code-style configuration visibility through slash commands:
+
+```bash
+/model
+/config
+/doctor
+/features
+/login
+```
+
+`/doctor` checks the active API key, base URL, provider, model, session directory, MCP config, skills, and tool protocol. Experimental flags can be enabled with `FEATURE_<NAME>=1`; for example `FEATURE_BUDDY=1` appears as `buddy` in `/features` and `/status`.
 
 ## Plan Mode
 
@@ -158,8 +185,16 @@ Mini Shell discovers skills from:
 | `.mini-code/skills/` | Mini Code project-local skills. |
 | `.agents/skills/` | Shared Agent Skills location. |
 | `.claude/skills/` | Project Claude Code skills. |
+| `~/.mini-code/skills/` | User Mini Code skills. |
+| `~/.agents/skills/` | User Agent Skills. |
+| `~/.claude/skills/` | User Claude-style skills. |
+| `~/.codex/skills/` | User Codex skills. |
+| `~/.codex/plugins/cache/` | Plugin-provided skills. |
+| `~/.cc-switch/skills/` | Additional local skill packs. |
 | `.mini-code/config.json` `skills` | Extra explicit files or directories. |
 | `--skill <path>` | Extra explicit skill path, repeatable. |
+
+Only `SKILL.md` files inside skill-pack directories are discovered from project, global, and plugin roots. Explicit configured single-file `.md` paths are still accepted for backwards compatibility.
 
 Supported skill format:
 
@@ -180,12 +215,45 @@ Commands:
 
 ```bash
 /skills
+/skill inspect code-review
 /skill:code-review inspect auth flow
+/skill:project:code-review inspect auth flow
 npm run dev -- --skill ./.claude/skills/code-review
 npm run dev -- --no-skills
 ```
 
-Mini Shell skills are text-only in this MVP: they are discovered, listed, injected into the prompt, and can be forced with `/skill:name`. They do not install packages or execute helper scripts automatically.
+`/skills` prints a table with `id`, `name`, `source`, `status`, `description`, and `path`. Status is `default` when `/skill:<name>` will load that item, `shadowed` when another skill with the same name wins by priority, and `disabled` when `disable-model-invocation=true`. Duplicate names are no longer hidden: use `/skill:<name>` for the default item or `/skill:<id>` for an exact duplicate.
+
+Mini Shell skills are instruction-first: they are discovered, listed with their source and status, inspected, injected into the prompt, and can be forced with `/skill:name` or `/skill:id`. Structured frontmatter can declare activation hints, references, allowed tools, and helper commands. Helper commands are suggestions only in this release and must still run through Mini Code's normal permission flow.
+
+## Native MCP
+
+Mini Code can load project-local MCP servers from `.mini-code/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "example": {
+      "command": "node",
+      "args": ["./scripts/mock-mcp-server.mjs"],
+      "env": {},
+      "risk": "read"
+    }
+  }
+}
+```
+
+MCP tools are exposed as `mcp:<server>:<tool>` and flow through the same validation, approval, event, and session-recording path as built-in tools. Unknown or omitted MCP risk defaults to `shell`; only tools configured as `read` are available in read-only plan mode.
+
+## Tool Protocols
+
+Mini Code defaults to its provider-neutral JSON decision protocol. Providers that support native tool calling can be enabled with:
+
+```bash
+npm run dev -- --tool-protocol native
+```
+
+Native OpenAI and Anthropic tool-call responses are normalized back into Mini Code's internal JSON decisions, so permissions, events, session records, and tool execution stay provider-agnostic.
 
 For Pi packages, extensions, prompt templates, custom tools, and future MCP-style workflows, use Pi directly through pass-through while Mini Code's native engine integration matures:
 
@@ -275,7 +343,7 @@ Example `.mini-code/config.json`:
 | `call_id` or `tool_call_id` is empty | Provider received a native tool-result role without a matching tool call. | Mini Code converts internal tool results to user text before provider calls; update and rerun tests if this appears. |
 | API key or 401 error | Provider credentials are missing or wrong. | Check `/status`, `.env.local`, and provider env vars. |
 | OpenAI-compatible 404/base URL error | `OPENAI_BASE_URL` points at the wrong root. | Use a `/v1` compatible URL such as `http://localhost:11434/v1`. |
-| Skill not found | The skill path was not discovered or name differs. | Run `/skills` and use the listed name. |
+| Skill not found | The skill path was not discovered, name differs, or a duplicate needs an exact id. | Run `/skills` and use the listed name or id. |
 
 Example `.env.local` for Anthropic:
 
@@ -325,6 +393,8 @@ npm run dev -- --fork <id-or-path>
 npm run dev -- --session-dir .mini-code/sessions
 npm run dev -- --no-session
 ```
+
+When resuming a session, Mini Code compares the saved capability snapshot with the currently discovered tools, MCP servers, and skills. If capabilities were added or removed, the shell prints a short warning so the model's available actions do not change silently.
 
 ## Legacy Mode
 

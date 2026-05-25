@@ -4,6 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createTools } from "./registry.js";
+import { ToolRegistry } from "./toolRegistry.js";
+import type { ToolDefinition } from "../core/types.js";
 
 test("write_file writes content and creates parent directories", async () => {
   const dir = await tempDir();
@@ -176,6 +178,25 @@ test("list_changed_files returns changed file names", async () => {
   }
 });
 
+test("ToolRegistry filters tools by policy and exposes capabilities", () => {
+  const registry = new ToolRegistry();
+  registry.register(fakeTool("read_notes", "read"));
+  registry.register(fakeTool("write_notes", "write"));
+
+  assert.deepEqual(registry.list("read_only").map((tool) => tool.name), ["read_notes"]);
+  assert.deepEqual(registry.list("default").map((tool) => tool.name), ["read_notes", "write_notes"]);
+  assert.deepEqual(registry.capabilities("read_only").map((capability) => capability.id), ["builtin:read_notes"]);
+  assert.match(registry.describeTools("read_only"), /id\s+name\s+kind\s+source\s+risk\s+description/);
+  assert.match(registry.describeTools("read_only"), /builtin:read_notes/);
+  assert.doesNotMatch(registry.describeTools("read_only"), /builtin:write_notes/);
+});
+
+test("ToolRegistry rejects duplicate tool names", () => {
+  const registry = new ToolRegistry();
+  registry.register(fakeTool("read_notes", "read"));
+  assert.throws(() => registry.register(fakeTool("read_notes", "read")), /already registered/);
+});
+
 function requiredTool(cwd: string, name: string) {
   const tool = createTools(cwd, 20_000, true).find((item) => item.name === name);
   assert.ok(tool, `missing tool ${name}`);
@@ -184,4 +205,17 @@ function requiredTool(cwd: string, name: string) {
 
 async function tempDir(): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), "mini-agent-tools-"));
+}
+
+function fakeTool(name: string, risk: ToolDefinition["risk"]): ToolDefinition {
+  return {
+    name,
+    description: `${name} description`,
+    inputSchema: {},
+    risk,
+    describe: () => name,
+    validate: () => undefined,
+    requiresApproval: () => ({ required: false, risk, reason: "test" }),
+    run: async () => ({ ok: true, output: "ok" })
+  };
 }

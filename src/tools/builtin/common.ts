@@ -155,6 +155,7 @@ export function rulesFor(tool: string): ToolRules {
     create_file: { path: { type: "string", required: true }, content: { type: "string" } },
     apply_patch: { patch: { type: "string", required: true } },
     git_apply_check: { patch: { type: "string", required: true } },
+    create_skill: { name: { type: "string", required: true }, description: { type: "string" }, instructions: { type: "string" } },
     run_command: { command: { type: "string", required: true }, timeoutMs: { type: "number" } },
     git_diff: { path: { type: "string" } },
     describe_capability: { id: { type: "string" }, name: { type: "string" } },

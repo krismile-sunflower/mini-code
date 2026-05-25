@@ -243,6 +243,11 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
         const reloadSummary = await session.reloadSkills();
         setAvailableSkills(session.getSkills());
         pushItems({ kind: "session", text: reloadSummary });
+      } else if (trimmed.startsWith("/skill create ")) {
+        const { name, description } = parseSkillCreateRequest(trimmed.slice("/skill create ".length));
+        const created = await session.createSkill(name, description);
+        setAvailableSkills(session.getSkills());
+        pushItems({ kind: "session", text: created });
       } else if (trimmed.startsWith("/skill:")) {
         const body = trimmed.slice("/skill:".length).trim();
         const [name = "", ...rest] = body.split(/\s+/);
@@ -460,6 +465,12 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
       {!approval && !pendingPlan && !skillPickerOpen && commandEntries.length > 0 ? <EnhancedCommandMenu entries={commandEntries} selectedIndex={selectedCommandIndex} /> : null}
     </Box>
   );
+}
+
+function parseSkillCreateRequest(value: string): { name: string; description: string } {
+  const trimmed = value.trim();
+  const [name = "", ...rest] = trimmed.split(/\s+/);
+  return { name, description: rest.join(" ") };
 }
 
 function SkillPickerPanel({ rows, selectedIndex, query, total }: { rows: SkillPickerRow[]; selectedIndex: number; query: string; total: number }) {
@@ -780,15 +791,15 @@ function ClaudeMarkdownBlock({ lines, accentColor = "white" }: { lines: Markdown
 function ClaudeMarkdownRow({ line, accentColor }: { line: MarkdownLine; accentColor: string }) {
   if (line.kind === "blank") return <Text> </Text>;
   if (line.kind === "heading") return <Text color="white" bold>{line.text}</Text>;
-  if (line.kind === "bullet") return <IndentedText level={line.level}><Text color="white">• </Text><InlineMarkdown text={line.text} /></IndentedText>;
+  if (line.kind === "bullet") return <IndentedText level={line.level}><Text color="white">- </Text><InlineMarkdown text={line.text} /></IndentedText>;
   if (line.kind === "ordered") return <IndentedText level={line.level}><Text color="gray">{line.text.replace(/\s.+$/, " ")} </Text><InlineMarkdown text={line.text.replace(/^\d+[.)]\s+/, "")} /></IndentedText>;
-  if (line.kind === "task") return <IndentedText level={line.level}><Text color={line.checked ? "green" : "gray"}>{line.checked ? "✓ " : "○ "}</Text><InlineMarkdown text={line.text} /></IndentedText>;
-  if (line.kind === "quote") return <Text color="gray">│ {line.text}</Text>;
+  if (line.kind === "task") return <IndentedText level={line.level}><Text color={line.checked ? "green" : "gray"}>{line.checked ? "[x] " : "[ ] "}</Text><InlineMarkdown text={line.text} /></IndentedText>;
+  if (line.kind === "quote") return <Text color="gray">| {line.text}</Text>;
   if (line.kind === "code") {
     if (line.text.startsWith("```")) return null;
     return <CodeLine line={line} />;
   }
-  if (line.kind === "hr") return <Text color="gray">────────────────────────────────────────────────</Text>;
+  if (line.kind === "hr") return <Text color="gray">------------------------------------------------</Text>;
   return <InlineMarkdown text={line.text} accentColor={accentColor} />;
 }
 

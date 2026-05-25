@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createTools } from "./registry.js";
+import { discoverSkills } from "../core/skills.js";
 import { ToolRegistry } from "./toolRegistry.js";
 import type { ToolDefinition } from "../core/types.js";
 
@@ -173,6 +174,48 @@ test("list_changed_files returns changed file names", async () => {
     assert.equal(result.ok, true);
     assert.match(result.output, /new\.txt/);
     assert.doesNotMatch(result.output, /\?\?/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("create_skill creates a discoverable project skill", async () => {
+  const dir = await tempDir();
+  try {
+    const tool = requiredTool(dir, "create_skill");
+    const result = await tool.run({
+      name: "Review Helper",
+      description: "Review code changes before commit",
+      instructions: "- Inspect git diff before commenting.\n- Separate blockers from suggestions."
+    });
+    const skillPath = path.join(dir, ".mini-code", "skills", "review-helper", "SKILL.md");
+    const skills = await discoverSkills(dir, [], true, { includeGlobal: false });
+
+    assert.equal(result.ok, true);
+    const skillText = await readFile(skillPath, "utf8");
+    assert.match(skillText, /name: review-helper/);
+    assert.match(skillText, /Inspect git diff before commenting/);
+    assert.equal(skills[0]?.name, "review-helper");
+    assert.deepEqual(result.metadata?.touchedPaths, [".mini-code/skills/review-helper/SKILL.md"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("create_skill requires write approval for the skill file", async () => {
+  const dir = await tempDir();
+  try {
+    const tool = requiredTool(dir, "create_skill");
+    const requirement = tool.requiresApproval({ name: "Review Helper" }, {
+      cwd: dir,
+      mode: "default",
+      allowedApprovalKeys: new Set(),
+      allowedCommandPrefixes: new Set()
+    });
+
+    assert.equal(requirement.required, true);
+    assert.equal(requirement.risk, "write");
+    assert.match(requirement.scope ?? "", /\.mini-code\/skills\/review-helper\/SKILL\.md/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

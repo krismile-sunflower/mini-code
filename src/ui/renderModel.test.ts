@@ -208,7 +208,7 @@ test("claudeDisplay maps conversation roles to Claude Code style rows", () => {
 
   const final = claudeDisplay({ kind: "final", text: "完成" });
   assert.equal(final.role, "assistant");
-  assert.equal(final.marker, "●");
+  assert.equal(final.marker, "*");
 
   const session = claudeDisplay({ kind: "session", text: "status" });
   assert.equal(session.role, "system");
@@ -221,7 +221,7 @@ test("claudeActivityLines renders read and thinking activity compactly", () => {
     { kind: "tool_request", turn: 1, tool: "read_file", description: "Read package.json", input: { path: "package.json" } }
   ], false, { running: true, elapsedSeconds: 7, outputTokens: 15, thoughtTokens: 10 });
   assert.match(pending.map((line) => line.text).join("\n"), /Reading 1 file\.\.\. \(ctrl\+o to expand\)/);
-  assert.match(pending.map((line) => line.text).join("\n"), /Blanching/);
+  assert.match(pending.map((line) => line.text).join("\n"), /Thinking/);
   assert.match(pending.map((line) => line.text).join("\n"), /down 15 tokens \| thought for 7s/);
 
   const completed = claudeActivityLines([
@@ -233,7 +233,7 @@ test("claudeActivityLines renders read and thinking activity compactly", () => {
   const withoutClock = claudeActivityLines([
     { kind: "thinking", turn: 1, text: "Need package metadata." }
   ], false);
-  assert.doesNotMatch(withoutClock.map((line) => line.text).join("\n"), /Blanching/);
+  assert.doesNotMatch(withoutClock.map((line) => line.text).join("\n"), /Thinking/);
   assert.doesNotMatch(withoutClock.map((line) => line.text).join("\n"), /thought for 2s/);
 });
 
@@ -247,7 +247,7 @@ test("claudeActivityLines deduplicates repeated compact activity rows", () => {
     { kind: "thinking", turn: 3, text: "Final check." }
   ], false, { running: true, elapsedSeconds: 24, outputTokens: 0, thoughtTokens: 94 });
   assert.equal(lines.filter((line) => /Reading 1 file/.test(line.text)).length, 1);
-  assert.equal(lines.filter((line) => /Blanching/.test(line.text)).length, 1);
+  assert.equal(lines.filter((line) => /Thinking/.test(line.text)).length, 1);
   assert.match(lines.map((line) => line.text).join("\n"), /thought for 24s/);
 });
 
@@ -514,6 +514,7 @@ test("command groups keep slash menu stable and grouped", () => {
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/permissions")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/skills")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/plan <request>")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/skill create <name> [description]")));
   assert.ok(commandGroups.some((group) => group.title === "Config" && group.commands.includes("/doctor")));
   assert.ok(commandGroups.some((group) => group.title === "Config" && group.commands.includes("/features")));
   assert.ok(commandGroups.some((group) => group.title === "View" && group.commands.includes("/details")));
@@ -530,6 +531,8 @@ test("renderCommandHelp shows grouped command descriptions", () => {
   assert.match(help, /Config:/);
   assert.match(help, /\/doctor\s+Run local configuration diagnostics/);
   assert.match(help, /\/skills\s+List discovered project skills/);
+  assert.match(help, /\/skill create <name> \[description\]\s+Create a project skill/);
+  assert.match(help, /\/skill:<name> <args>\s+Run a named skill/);
 });
 
 test("welcome model mirrors the compact Claude Code style start screen", () => {
@@ -544,10 +547,11 @@ test("slash filtering prioritizes commands before skill entries", () => {
 
   assert.equal(entries[0]?.command, "/skills");
   assert.equal(entries[1]?.command, "/skill inspect <name>");
-  assert.equal(entries[2]?.command, "/skill reload");
-  assert.equal(entries[3]?.command, "/skill:<name> <args>");
-  assert.equal(entries[4]?.command, "/skill:skill-generator");
-  assert.match(entries[4]?.description ?? "", /default project:project:skill-generator/);
+  assert.equal(entries[2]?.command, "/skill create <name> [description]");
+  assert.equal(entries[3]?.command, "/skill reload");
+  assert.equal(entries[4]?.command, "/skill:<name> <args>");
+  assert.equal(entries[5]?.command, "/skill:skill-generator");
+  assert.match(entries[5]?.description ?? "", /default project:project:skill-generator/);
 });
 
 test("slash filtering supports subcommands and exact skill ids", () => {

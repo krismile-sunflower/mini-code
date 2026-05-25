@@ -226,7 +226,7 @@ export function inputStatusModel(input: {
   const queueText = input.queueCount ? ` | queued ${input.queueCount}` : "";
   const usageLine = `${model} | turn ${input.status.turn} | msg ${input.status.messages} | ~${totalTokens} tokens | tools ${input.usage.toolCount}${queueText} | ${permissionModeLabel(input.status.permissionMode)}`;
   if (input.status.state === "running" || input.status.state === "aborting") {
-    const action = input.usage.lastActivity === "tool" ? "Using tools" : input.usage.lastActivity === "answer" ? "Answering" : "Blanching";
+    const action = input.usage.lastActivity === "tool" ? "Using tools" : input.usage.lastActivity === "answer" ? "Answering" : "Thinking";
     const queued = input.queueCount ? ` | queued ${input.queueCount}` : "";
     return {
       prompt: "",
@@ -267,7 +267,7 @@ export function headerFields(status: StatusModel): HeaderField[] {
 
 export const commandGroups: CommandGroup[] = [
   { title: "Session", commands: ["/help", "/status", "/memory", "/init", "/sessions", "/new", "/resume <id>", "/rename <title>", "/export-session <path>"] },
-  { title: "Work", commands: ["/plan <request>", "/execute <plan-id>", "/tools", "/permissions", "/skills", "/skill inspect <name>", "/skill reload", "/skill:<name> <args>", "/capabilities"] },
+  { title: "Work", commands: ["/plan <request>", "/execute <plan-id>", "/tools", "/permissions", "/skills", "/skill inspect <name>", "/skill create <name> [description]", "/skill reload", "/skill:<name> <args>", "/capabilities"] },
   { title: "MCP", commands: ["/mcp", "/mcp tools", "/mcp resources", "/mcp prompts", "/mcp reconnect <server>"] },
   { title: "View", commands: ["/details", "/expand", "/history", "/clear", "/queue", "/queue clear"] },
   { title: "Context", commands: ["/compact", "/summary"] },
@@ -511,10 +511,10 @@ export function timelineLabel(item: TimelineItem): TimelineLabel {
 
 export function claudeDisplay(item: TimelineItem): ClaudeDisplay {
   if (item.kind === "user") return { role: "user", marker: ">", markerColor: "#bfc1ff", textColor: "white", background: "#3a3a3a" };
-  if (item.kind === "assistant_text" || item.kind === "final") return { role: "assistant", marker: "●", markerColor: "white", textColor: "white" };
+  if (item.kind === "assistant_text" || item.kind === "final") return { role: "assistant", marker: "*", markerColor: "white", textColor: "white" };
   if (item.kind === "error") return { role: "error", marker: "*", markerColor: "red", textColor: "red" };
   if (item.kind === "session" || item.kind === "compact") return { role: "system", marker: "", markerColor: "gray", textColor: "gray" };
-  return { role: "activity", marker: "●", markerColor: "gray", textColor: "gray" };
+  return { role: "activity", marker: "*", markerColor: "gray", textColor: "gray" };
 }
 
 export function detailForItem(item: TimelineItem | undefined, expanded: boolean): DetailModel | undefined {
@@ -635,14 +635,14 @@ export function claudeActivityLines(items: TimelineItem[], expanded: boolean, st
   }
   for (const change of compactCodeChanges(codeChanges)) {
     const fileCount = change.files.length || 1;
-    lines.push({ marker: "●", markerColor: "gray", textColor: "gray", text: `${change.status === "applied" ? "Edited" : "Editing"} ${fileCount} file${fileCount === 1 ? "" : "s"} (ctrl+o to expand)` });
+    lines.push({ marker: "*", markerColor: "gray", textColor: "gray", text: `${change.status === "applied" ? "Edited" : "Editing"} ${fileCount} file${fileCount === 1 ? "" : "s"} (ctrl+o to expand)` });
   }
   for (const item of permissions) {
-    lines.push({ marker: item.blocked ? "*" : "●", markerColor: item.blocked ? "red" : "yellow", textColor: item.blocked ? "red" : "yellow", text: item.blocked ? `Permission blocked: ${item.text}` : `Permission required: ${item.text}` });
+    lines.push({ marker: item.blocked ? "!" : "*", markerColor: item.blocked ? "red" : "yellow", textColor: item.blocked ? "red" : "yellow", text: item.blocked ? `Permission blocked: ${item.text}` : `Permission required: ${item.text}` });
   }
   const latestThinking = thinking.at(-1);
   if (latestThinking && state?.running) {
-    lines.push({ marker: "*", markerColor: "#ff7a45", textColor: "#ff7a45", text: blanchingText(thinking.map((item) => item.text).join("\n"), state) });
+    lines.push({ marker: "*", markerColor: "#ff7a45", textColor: "#ff7a45", text: thinkingText(thinking.map((item) => item.text).join("\n"), state) });
   }
   if (expanded) {
     for (const detail of asciiActivityDetails(items)) {
@@ -650,7 +650,7 @@ export function claudeActivityLines(items: TimelineItem[], expanded: boolean, st
     }
   }
   if (!expanded && lines.length === 0) return [];
-  if (lines.length === 0) return [{ marker: "●", markerColor: "gray", textColor: "gray", text: asciiActivitySummary(items) }];
+  if (lines.length === 0) return [{ marker: "*", markerColor: "gray", textColor: "gray", text: asciiActivitySummary(items) }];
   return lines;
 }
 
@@ -704,14 +704,14 @@ function toolActivityLine(request: Extract<TimelineItem, { kind: "tool_request" 
   const count = Math.max(1, unitCount);
   const plural = count === 1 ? "" : "s";
   if (request.tool === "run_command") {
-    return { marker: "●", markerColor: "gray", textColor: "gray", text: `${completed ? "Ran" : "Running"} command (ctrl+o to expand)` };
+    return { marker: "*", markerColor: "gray", textColor: "gray", text: `${completed ? "Ran" : "Running"} command (ctrl+o to expand)` };
   }
   if (isExplorationTool(request.tool)) {
     const verb = completed ? "Read" : "Reading";
     const suffix = completed ? "" : "...";
-    return { marker: "●", markerColor: "gray", textColor: "gray", text: `${verb} ${count} file${plural}${suffix} (ctrl+o to expand)` };
+    return { marker: "*", markerColor: "gray", textColor: "gray", text: `${verb} ${count} file${plural}${suffix} (ctrl+o to expand)` };
   }
-  return { marker: "●", markerColor: "gray", textColor: "gray", text: `${completed ? "Used" : "Using"} ${request.tool} (ctrl+o to expand)` };
+  return { marker: "*", markerColor: "gray", textColor: "gray", text: `${completed ? "Used" : "Using"} ${request.tool} (ctrl+o to expand)` };
 }
 
 function toolUnitCount(request: Extract<TimelineItem, { kind: "tool_request" }>): number {
@@ -720,12 +720,12 @@ function toolUnitCount(request: Extract<TimelineItem, { kind: "tool_request" }>)
   return 1;
 }
 
-function blanchingText(thought: string, state?: ActivityDisplayState): string {
+function thinkingText(thought: string, state?: ActivityDisplayState): string {
   const thoughtTokens = state?.thoughtTokens || estimateTextTokens(thought);
   const outputTokens = state?.outputTokens ?? 0;
   const tokenText = outputTokens > 0 ? `down ${outputTokens} tokens` : `${thoughtTokens} thought tokens`;
   const elapsedText = typeof state?.elapsedSeconds === "number" && state.elapsedSeconds > 0 ? ` | thought for ${Math.max(1, state.elapsedSeconds)}s` : "";
-  return `Blanching... (${tokenText}${elapsedText})`;
+  return `Thinking... (${tokenText}${elapsedText})`;
 }
 
 function asciiActivitySummary(items: TimelineItem[]): string {
@@ -1127,6 +1127,7 @@ function toolTarget(tool: string, input: Record<string, unknown>): string {
   if (tool === "search" && typeof input.query === "string") return JSON.stringify(input.query);
   if (tool === "list_files" && typeof input.path === "string") return input.path;
   if ((tool === "apply_patch" || tool === "git_apply_check") && typeof input.patch === "string") return patchFiles(input.patch);
+  if (tool === "create_skill" && typeof input.name === "string") return input.name;
   if (tool === "list_changed_files") return "changed files";
   return "";
 }
@@ -1224,6 +1225,7 @@ export const commandDescriptions: Record<string, string> = {
   "/queue": "Show queued requests",
   "/queue clear": "Clear queued requests",
   "/skill inspect": "Inspect one skill or duplicate candidates",
+  "/skill create": "Create a project skill under .mini-code/skills",
   "/skill reload": "Rediscover skills without restarting",
   "/skill:": "Run a named skill with optional args",
   "/mcp": "Show configured MCP servers",
@@ -1323,6 +1325,7 @@ function commandMatches(command: string, query: string): boolean {
 }
 
 function commandKey(command: string): string {
+  if (command.startsWith("/skill:")) return "/skill:";
   return command.replace(/\s+<.*$/, "").replace(/\s+\(.+$/, "");
 }
 

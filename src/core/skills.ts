@@ -8,6 +8,16 @@ export interface SkillDiscoveryOptions {
   homeDir?: string;
 }
 
+export interface SkillCreateResult {
+  name: string;
+  path: string;
+  description: string;
+}
+
+export interface SkillCreateOptions {
+  instructions?: string;
+}
+
 interface SkillRoot {
   path: string;
   source: NonNullable<SkillInfo["source"]>;
@@ -84,6 +94,19 @@ export function renderSkillInspect(skill: SkillInfo, candidates: SkillInfo[] = [
 
 export function skillInjection(skill: SkillInfo, args: string): string {
   return [`Use Mini Code skill: ${skill.name}`, skill.description ? `Description: ${skill.description}` : "", args ? `User arguments: ${args}` : "", "Skill content:", skill.content].filter(Boolean).join("\n\n");
+}
+
+export async function createProjectSkill(cwd: string, rawName: string, rawDescription = "", options: SkillCreateOptions = {}): Promise<SkillCreateResult> {
+  const name = normalizeName(rawName);
+  if (!name || name === "skill") throw new Error("Skill name is required. Usage: /skill create <name> [description]");
+  const description = cleanDescription(rawDescription) || `Use when working on ${name.replaceAll("-", " ")} tasks.`;
+  const instructions = cleanInstructions(options.instructions ?? "");
+  const directory = path.join(cwd, ".mini-code", "skills", name);
+  const filePath = path.join(directory, "SKILL.md");
+  if (await exists(filePath)) throw new Error(`Skill already exists: ${filePath}`);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(filePath, renderSkillTemplate(name, description, instructions), "utf8");
+  return { name, description, path: filePath };
 }
 
 export function defaultSkills(skills: SkillInfo[]): SkillInfo[] {
@@ -249,6 +272,43 @@ function firstParagraph(body: string): string {
 
 function normalizeName(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "skill";
+}
+
+function cleanDescription(value: string): string {
+  return value.trim().replace(/^['"]|['"]$/g, "").replace(/\s+/g, " ");
+}
+
+function cleanInstructions(value: string): string {
+  return value.trim().replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function renderSkillTemplate(name: string, description: string, instructions = ""): string {
+  const title = name.split("-").map((part) => part ? `${part[0]?.toUpperCase()}${part.slice(1)}` : part).join(" ");
+  const customInstructions = instructions ? ["## Skill Instructions", "", instructions, ""] : [];
+  return [
+    "---",
+    `name: ${name}`,
+    `description: ${description}`,
+    "---",
+    "",
+    `# ${title}`,
+    "",
+    "Use this skill when the request matches the description above.",
+    "",
+    ...customInstructions,
+    "## Workflow",
+    "",
+    "1. Inspect the relevant project files before changing behavior.",
+    "2. Identify the smallest reusable procedure or resource that helps with this task.",
+    "3. Make focused changes that follow the existing project conventions.",
+    "4. Run the most relevant validation command and report any remaining risk.",
+    "",
+    "## Notes",
+    "",
+    "- Keep instructions concise and specific to this skill.",
+    "- Add `references/`, `scripts/`, or `assets/` only when they remove repeated work or preserve important domain knowledge.",
+    ""
+  ].join("\n");
 }
 
 function splitWords(value: string | undefined): string[] {

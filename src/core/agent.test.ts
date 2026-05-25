@@ -540,6 +540,33 @@ test("AgentSession can use provider native tool protocol", async () => {
   }
 });
 
+test("AgentSession can create a skill through the model-callable tool", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-create-skill-"));
+  const originalFetch = globalThis.fetch;
+  const responses = [
+    '{"action":"tool","tool":"create_skill","input":{"name":"Review Helper","description":"Review code changes before commit","instructions":"- Inspect the current diff first.\\n- Report blockers before suggestions."},"thought":"A dedicated skill scaffold is needed."}',
+    '{"action":"final","answer":"Created the review-helper skill."}'
+  ];
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: responses.shift() } }] });
+  const events: AgentEvent[] = [];
+  try {
+    const session = await AgentSession.create(config(dir, { maxTurns: 4 }), (event) => events.push(event), async () => "allow_once");
+    const answer = await session.run("create a skill named Review Helper for reviewing code changes");
+    const skillPath = path.join(dir, ".mini-code", "skills", "review-helper", "SKILL.md");
+
+    assert.equal(answer, "Created the review-helper skill.");
+    const skillText = await readFile(skillPath, "utf8");
+    assert.match(skillText, /name: review-helper/);
+    assert.match(skillText, /Inspect the current diff first/);
+    assert.ok(session.getSkills().some((skill) => skill.name === "review-helper"));
+    assert.ok(events.some((event) => event.type === "tool_request" && event.tool === "create_skill"));
+    assert.ok(events.some((event) => event.type === "tool_result" && event.tool === "create_skill" && event.ok));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("AgentSession createPlan does not execute write tools", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-no-write-"));
   const file = path.join(dir, "note.txt");

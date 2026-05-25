@@ -126,6 +126,11 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       output.write(`${await session.reloadSkills()}\n`);
       continue;
     }
+    if (request.startsWith("/skill create ")) {
+      const { name, description } = parseSkillCreateRequest(request.slice("/skill create ".length));
+      output.write(`${await session.createSkill(name, description)}\n`);
+      continue;
+    }
     if (request.startsWith("/skill:")) {
       const body = request.slice("/skill:".length).trim();
       const [name = "", ...rest] = body.split(/\s+/);
@@ -207,6 +212,12 @@ async function printSessions(sessionDir: string): Promise<void> {
   for (const session of sessions) {
     output.write(`${session.id}\t${session.updatedAt}\t${session.model}\t${session.title}\t${session.summary.slice(0, 80)}\n`);
   }
+}
+
+function parseSkillCreateRequest(value: string): { name: string; description: string } {
+  const trimmed = value.trim();
+  const [name = "", ...rest] = trimmed.split(/\s+/);
+  return { name, description: rest.join(" ") };
 }
 
 function renderEvent(event: AgentEvent): void {

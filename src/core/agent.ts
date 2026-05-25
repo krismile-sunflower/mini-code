@@ -5,7 +5,7 @@ import { DenialTracker } from "./denial.js";
 import { loadProjectMemory } from "./memory.js";
 import { fallbackReadFilePath, finalClaimsToolUse, requiresPlan, requiresWorkspaceTool } from "./policy.js";
 import { executePlanRequest, planModeRequest, planRequiredCorrection, planSystemPrompt, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
-import { defaultSkills, discoverSkills, renderSkillInspect, renderSkillList, resolveSkill, skillInjection } from "./skills.js";
+import { createProjectSkill, defaultSkills, discoverSkills, renderSkillInspect, renderSkillList, resolveSkill, skillInjection } from "./skills.js";
 import { complete } from "../providers/llm.js";
 import { commandPrefix, commandPrefixApprovalKey } from "../tools/permissions.js";
 import { SessionStore } from "../storage/sessionStore.js";
@@ -450,6 +450,7 @@ export class AgentSession {
 
       const result = await tool.run(input);
       await this.recordToolResult(task, turn, tool.name, result.ok, result.output, result.errorType, result.metadata);
+      if (result.ok && tool.name === "create_skill") await this.refreshSkillContext();
       return true;
   }
 
@@ -798,6 +799,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
     const before = this.skills;
     const after = await discoverSkills(this.config.cwd, this.config.skills, this.config.enableSkills, { includeGlobal: this.config.includeGlobalSkills });
     this.skills = after;
+    await this.refreshSystemPromptForSkills();
     const beforeIds = new Set(before.map((skill) => skill.id));
     const afterIds = new Set(after.map((skill) => skill.id));
     const added = after.filter((skill) => !beforeIds.has(skill.id)).map((skill) => skill.id).sort();
@@ -816,6 +818,38 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       `defaults=${defaultSkills(after).length} shadowed=${after.filter((skill) => skill.shadowedBy).length}`,
       added.length ? `added: ${added.join(", ")}` : "added: none",
       removed.length ? `removed: ${removed.join(", ")}` : "removed: none"
+    ].join("\n");
+  }
+
+  private async refreshSkillContext(): Promise<void> {
+    this.skills = await discoverSkills(this.config.cwd, this.config.skills, this.config.enableSkills, { includeGlobal: this.config.includeGlobalSkills });
+    await this.refreshSystemPromptForSkills();
+    await this.persist();
+  }
+
+  private async refreshSystemPromptForSkills(): Promise<void> {
+    const projectMemory = await loadProjectMemory(this.config.cwd);
+    if (this.messages[0]?.role === "system") this.messages[0] = { role: "system", content: systemPrompt(Array.from(this.tools.values()), this.skills, projectMemory) };
+  }
+
+  async createSkill(rawName: string, rawDescription = ""): Promise<string> {
+    const created = await createProjectSkill(this.config.cwd, rawName, rawDescription);
+    const reloadSummary = await this.reloadSkills();
+    this.messages.push({
+      role: "user",
+      content: [
+        `Project skill created: ${created.name}`,
+        `Path: ${created.path}`,
+        `Description: ${created.description}`,
+        "Use /skill:<name> to load it, or edit SKILL.md to specialize the workflow."
+      ].join("\n")
+    });
+    await this.persist();
+    return [
+      `Created skill ${created.name}`,
+      `path: ${created.path}`,
+      `description: ${created.description}`,
+      reloadSummary
     ].join("\n");
   }
 

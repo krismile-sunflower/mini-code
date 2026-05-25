@@ -92,6 +92,7 @@ Mini Shell provides Claude-Code-like workflows through slash commands and hotkey
 | `/permissions` | Show permission mode and remembered approvals. |
 | `/skills` | Show every discovered skill with stable id, source, status, description, and path. |
 | `/skill inspect <name-or-id>` | Show a skill manifest; duplicate names show all candidates and the default. |
+| `/skill create <name> [description]` | Create `.mini-code/skills/<name>/SKILL.md` and reload skills. |
 | `/skill reload` | Rediscover skills and refresh the session/TUI skill list without restarting. |
 | `/skill:<name-or-id> <args>` | Load the default skill for a name, or an exact skill by id. |
 | `/mcp` | Show configured MCP servers. |
@@ -170,6 +171,8 @@ Pi's built-in tools are:
 | `find` | Find files by glob. |
 | `ls` | List directory contents. |
 
+Mini Code also exposes a native `create_skill` write tool to its model. When the user asks in normal language to create a reusable skill, the agent can call this tool instead of guessing the `.mini-code/skills/<name>/SKILL.md` layout by hand.
+
 By default Pi gives the model `read`, `write`, `edit`, and `bash`. `grep`, `find`, and `ls` can be enabled with `--tools`.
 
 Pi discovers `AGENTS.md` and `CLAUDE.md` context files unless `--no-context-files` is passed.
@@ -215,6 +218,7 @@ Commands:
 
 ```bash
 /skills
+/skill create code-review Review code carefully before changes
 /skill inspect code-review
 /skill:code-review inspect auth flow
 /skill:project:code-review inspect auth flow
@@ -222,7 +226,7 @@ npm run dev -- --skill ./.claude/skills/code-review
 npm run dev -- --no-skills
 ```
 
-`/skills` prints a table with `id`, `name`, `source`, `status`, `description`, and `path`. Status is `default` when `/skill:<name>` will load that item, `shadowed` when another skill with the same name wins by priority, and `disabled` when `disable-model-invocation=true`. Duplicate names are no longer hidden: use `/skill:<name>` for the default item or `/skill:<id>` for an exact duplicate.
+`/skill create <name> [description]` scaffolds a project-local skill in `.mini-code/skills/<name>/SKILL.md`, normalizes the name to lowercase hyphen-case, refuses to overwrite an existing skill, and reloads the skill index immediately. The same behavior is available to the model through the `create_skill` tool, so natural-language requests such as "create a skill for reviewing pull requests" can be handled directly. `/skills` prints a table with `id`, `name`, `source`, `status`, `description`, and `path`. Status is `default` when `/skill:<name>` will load that item, `shadowed` when another skill with the same name wins by priority, and `disabled` when `disable-model-invocation=true`. Duplicate names are no longer hidden: use `/skill:<name>` for the default item or `/skill:<id>` for an exact duplicate.
 
 Mini Shell skills are instruction-first: they are discovered, listed with their source and status, inspected, injected into the prompt, and can be forced with `/skill:name` or `/skill:id`. Structured frontmatter can declare activation hints, references, allowed tools, and helper commands. Helper commands are suggestions only in this release and must still run through Mini Code's normal permission flow.
 

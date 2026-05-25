@@ -37,6 +37,7 @@ Work like a careful terminal coding harness:
 - Prefer list_changed_files when you only need changed file names.
 - Return exactly one JSON object each turn. Do not wrap it in markdown.
 - Use todo_write to maintain a live task list whenever working on multi-step tasks.
+- If the user asks to create a reusable skill, use the create_skill tool with a concise description and task-specific instructions; if it is unavailable, create .mini-code/skills/<skill-name>/SKILL.md with concise frontmatter and workflow instructions.
 
 ${projectMemory ? `## Project Memory (CLAUDE.md)\n\n${projectMemory}\n\n` : ""}Available tools:
 ${renderTools(tools)}

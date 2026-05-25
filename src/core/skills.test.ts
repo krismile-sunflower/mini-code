@@ -4,7 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { defaultSkills, discoverSkills, renderSkillInspect, renderSkillList, resolveSkill, skillInjection, skillRoots } from "./skills.js";
+import { createProjectSkill, defaultSkills, discoverSkills, renderSkillInspect, renderSkillList, resolveSkill, skillInjection, skillRoots } from "./skills.js";
 
 test("discoverSkills finds project and claude skill files", async () => {
   const cwd = mkdtempSync(path.join(tmpdir(), "mini-skills-"));
@@ -28,6 +28,29 @@ test("discoverSkills can be disabled", async () => {
   await writeFile(path.join(cwd, ".mini-code", "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Review\n---\nBody\n");
 
   assert.deepEqual(await discoverSkills(cwd, [], false, { includeGlobal: false }), []);
+});
+
+test("createProjectSkill scaffolds a discoverable project skill", async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "mini-skills-create-"));
+  const created = await createProjectSkill(cwd, "Skill Builder", "Create high quality project skills");
+  const skills = await discoverSkills(cwd, [], true, { includeGlobal: false });
+
+  assert.equal(created.name, "skill-builder");
+  assert.match(created.path, /SKILL\.md$/);
+  assert.equal(skills[0]?.name, "skill-builder");
+  assert.equal(skills[0]?.description, "Create high quality project skills");
+  assert.match(skills[0]?.content ?? "", /## Workflow/);
+  await assert.rejects(() => createProjectSkill(cwd, "Skill Builder"), /already exists/);
+});
+
+test("createProjectSkill can include task-specific instructions", async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "mini-skills-create-instructions-"));
+  await createProjectSkill(cwd, "PR Reviewer", "Review pull requests", { instructions: "- Check tests first.\n- Summarize blocking risks." });
+  const [skill] = await discoverSkills(cwd, [], true, { includeGlobal: false });
+
+  assert.match(skill?.content ?? "", /## Skill Instructions/);
+  assert.match(skill?.content ?? "", /Check tests first/);
+  assert.match(skill?.content ?? "", /Summarize blocking risks/);
 });
 
 test("discoverSkills includes user-level skill roots by default", async () => {

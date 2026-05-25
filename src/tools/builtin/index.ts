@@ -3,6 +3,7 @@ import { createEditTools } from "./edit.js";
 import { createFileTools } from "./files.js";
 import { createGitTools } from "./git.js";
 import { createShellTools } from "./shell.js";
+import { createSkillTools } from "./skills.js";
 import { createTodoTools } from "./todo.js";
 import { finalizeBuiltinTools, type BuiltinToolContext } from "./common.js";
 
@@ -13,6 +14,7 @@ export function createBuiltinTools(cwd: string, maxOutputChars: number, allowDan
     ...createEditTools(context),
     ...createShellTools(context),
     ...createGitTools(context),
+    ...createSkillTools(context),
     ...createTodoTools()
   ]);
 }

@@ -4,7 +4,7 @@ export function requiresWorkspaceTool(userRequest: string): boolean {
   const toolIntent = [
     /\b(read|open|inspect|view|show|search|find|grep|cat|look at|check|edit|modify|update|write|create|delete|run|execute|test|build)\b/i,
     /\b(git|status|diff|file|folder|directory|repo|workspace|package\.json|readme)\b/i,
-    /(读取|读一下|查看|打开|搜索|查找|修改|更新|写入|创建|删除|运行|执行|测试|构建|文件|目录|仓库|项目|状态|差异)/
+    /(?:\u8bfb\u53d6|\u67e5\u770b|\u6253\u5f00|\u641c\u7d22|\u67e5\u627e|\u68c0\u67e5|\u4fee\u6539|\u66f4\u65b0|\u5199\u5165|\u521b\u5efa|\u65b0\u5efa|\u5220\u9664|\u8fd0\u884c|\u6267\u884c|\u6d4b\u8bd5|\u6784\u5efa|\u6587\u4ef6|\u76ee\u5f55|\u4ed3\u5e93|\u9879\u76ee|\u72b6\u6001|\u5dee\u5f02|\u6280\u80fd)/
   ];
   return hasPathLikeText || toolIntent.some((pattern) => pattern.test(userRequest));
 }
@@ -12,13 +12,13 @@ export function requiresWorkspaceTool(userRequest: string): boolean {
 export function requiresPlan(userRequest: string): boolean {
   const patterns = [
     /\b(implement|fix|refactor|add|change|modify|update|build|test|redesign|rework|migrate|integrate)\b/i,
-    /(实现|修复|重构|新增|增加|修改|更新|构建|测试|重新设计|迁移|接入|完善|优化)/
+    /(?:\u5b9e\u73b0|\u4fee\u590d|\u91cd\u6784|\u65b0\u589e|\u589e\u52a0|\u4fee\u6539|\u66f4\u65b0|\u6784\u5efa|\u6d4b\u8bd5|\u91cd\u65b0\u8bbe\u8ba1|\u8fc1\u79fb|\u63a5\u5165|\u5b8c\u5584|\u4f18\u5316|\u521b\u5efa\u6280\u80fd|\u65b0\u5efa\u6280\u80fd)/
   ];
   return patterns.some((pattern) => pattern.test(userRequest));
 }
 
 export function finalClaimsToolUse(answer: string): boolean {
-  return /(I (?:read|inspected|opened|searched|checked|ran|executed|edited|modified|updated)|I've (?:read|inspected|searched|checked|run)|我(?:已|已经)?(?:读取|查看|检查|搜索|运行|执行|修改|更新)了?)/i.test(answer);
+  return /(I (?:read|inspected|opened|searched|checked|ran|executed|edited|modified|updated|created)|I've (?:read|inspected|searched|checked|run|created)|(?:\u6211)?(?:\u5df2\u7ecf)?(?:\u8bfb\u53d6|\u67e5\u770b|\u68c0\u67e5|\u641c\u7d22|\u8fd0\u884c|\u6267\u884c|\u4fee\u6539|\u66f4\u65b0|\u521b\u5efa)(?:\u4e86)?)/i.test(answer);
 }
 
 export function fallbackReadFilePath(userRequest: string): string | undefined {

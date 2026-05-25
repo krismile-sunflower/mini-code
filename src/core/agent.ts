@@ -6,7 +6,7 @@ import { fallbackReadFilePath, finalClaimsToolUse, requiresPlan, requiresWorkspa
 import { executePlanRequest, planModeRequest, planRequiredCorrection, planSystemPrompt, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
 import { discoverSkills, renderSkillList, skillInjection } from "./skills.js";
 import { complete } from "../providers/llm.js";
-import { commandPrefix } from "../tools/permissions.js";
+import { commandPrefix, commandPrefixApprovalKey } from "../tools/permissions.js";
 import { SessionStore } from "../storage/sessionStore.js";
 import { createTools } from "../tools/registry.js";
 import type {
@@ -96,7 +96,7 @@ export class AgentSession {
     this.sessionStore = new SessionStore(config.sessionDir);
     this.approvalContext = {
       cwd: config.cwd,
-      allowedTools: new Set<string>(),
+      mode: config.permissionMode,
       allowedCommandPrefixes: new Set<string>(),
       allowedApprovalKeys: new Set<string>()
     };
@@ -245,6 +245,7 @@ export class AgentSession {
   async createPlan(userRequest: string): Promise<PlanRecord> {
     const readOnlyTools = Array.from(this.tools.values()).filter((tool) => tool.risk === "read");
     const readOnlyToolMap = new Map(readOnlyTools.map((tool) => [tool.name, tool]));
+    const inspectionEvents: string[] = [];
     const planMessages: Message[] = [
       { role: "system", content: planSystemPrompt(readOnlyTools, this.skills) },
       ...(this.summary ? [{ role: "user" as const, content: `Current session summary:\n${this.summary}` }] : []),
@@ -284,7 +285,7 @@ export class AgentSession {
 
       if (decision.action === "final") {
         const answer = decision.answer ?? "";
-        const plan = parsePlanRecord(userRequest, this.config.planModel, answer);
+        const plan = parsePlanRecord(userRequest, this.config.planModel, answer, inspectionEvents);
         this.record.plans = [...(this.record.plans ?? []), plan];
         await this.persist();
         return plan;
@@ -301,9 +302,11 @@ export class AgentSession {
 
       const input = decision.input ?? {};
       const description = tool.describe(input);
+      inspectionEvents.push(`tool ${tool.name}: ${description}`);
       await this.emit({ type: "tool_request", turn, tool: tool.name, input, thought: decision.thought, description });
       const validation = tool.validate(input);
       const result = validation ?? await tool.run(input);
+      inspectionEvents.push(`result ${tool.name}: ${result.ok ? "ok" : "failed"}`);
       await this.emit({ type: "tool_result", turn, tool: tool.name, ok: result.ok, output: result.output, errorType: result.errorType, metadata: result.metadata });
       planMessages.push({
         role: "tool",
@@ -327,15 +330,21 @@ export class AgentSession {
 
   async cancelPlan(id: string): Promise<PlanRecord> {
     const plan = this.findPlan(id);
+    if (plan.status === "executed") throw new Error(`Plan already executed: ${plan.id}`);
     plan.status = "cancelled";
+    plan.statusReason = "Cancelled by user.";
     await this.persist();
     return plan;
   }
 
   async executePlan(id: string): Promise<string> {
-    const plan = await this.approvePlan(id);
+    const plan = this.findPlan(id);
+    if (plan.status === "cancelled") throw new Error(`Plan is cancelled and cannot be executed: ${plan.id}`);
+    if (plan.status === "executed") throw new Error(`Plan has already been executed: ${plan.id}`);
+    await this.approvePlan(id);
     const answer = await this.run(executePlanRequest(plan.answer, plan.request).content);
     plan.status = "executed";
+    plan.statusReason = "Executed from approved plan.";
     plan.executedAt = new Date().toISOString();
     await this.persist();
     return answer;
@@ -528,12 +537,17 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   }
 
   describePermissions(): string {
-    const remembered = Array.from(this.approvalContext.allowedApprovalKeys).sort();
+    const remembered = Array.from(this.approvalContext.allowedApprovalKeys).filter((key) => !key.startsWith("mode:")).sort();
+    const prefixes = Array.from(this.approvalContext.allowedCommandPrefixes).sort();
     return [
       "read: allowed",
-      "ordinary write: allowed; sensitive/delete/unusual writes require approval",
+      this.permissionMode === "accept_edits" || this.permissionMode === "bypass_permissions"
+        ? "ordinary write: allowed; sensitive/delete/unusual writes require approval"
+        : "ordinary write: ask; sensitive/delete/unusual writes require approval",
       "shell: ask; dangerous commands blocked unless --allow-dangerous",
-      remembered.length ? `remembered approvals:\n${remembered.join("\n")}` : "remembered approvals: none"
+      this.permissionMode === "bypass_permissions" ? "bypass permissions: non-dangerous shell is allowed" : `permission mode: ${this.permissionMode}`,
+      remembered.length ? `remembered approvals:\n${remembered.join("\n")}` : "remembered approvals: none",
+      prefixes.length ? `remembered command prefixes:\n${prefixes.join("\n")}` : "remembered command prefixes: none"
     ].join("\n");
   }
 
@@ -561,6 +575,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   }
 
   private applyPermissionMode(mode: PermissionMode): void {
+    this.approvalContext.mode = mode;
     this.approvalContext.allowedApprovalKeys.delete("mode:accept_edits");
     this.approvalContext.allowedApprovalKeys.delete("mode:bypass_permissions");
     if (mode === "accept_edits") this.approvalContext.allowedApprovalKeys.add("mode:accept_edits");
@@ -610,7 +625,13 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   private rememberApproval(tool: string, input: Record<string, unknown>, key: string | undefined, decision: ApprovalDecision): void {
     if (decision !== "always_allow") return;
     const approvalKey = key ?? (tool === "run_command" && typeof input.command === "string" ? commandPrefix(input.command) : undefined);
-    if (approvalKey) this.approvalContext.allowedApprovalKeys.add(approvalKey);
+    if (!approvalKey) return;
+    this.approvalContext.allowedApprovalKeys.add(approvalKey);
+    if (approvalKey.startsWith("shell:prefix:")) this.approvalContext.allowedCommandPrefixes.add(approvalKey.slice("shell:prefix:".length));
+    if (!approvalKey.startsWith("shell:") && tool === "run_command" && typeof input.command === "string") {
+      this.approvalContext.allowedCommandPrefixes.add(commandPrefix(input.command));
+      this.approvalContext.allowedApprovalKeys.add(commandPrefixApprovalKey(commandPrefix(input.command)));
+    }
   }
 
   private async recordToolResult(task: TaskRecord, turn: number, tool: string, ok: boolean, output: string, errorType?: ToolErrorType, metadata?: ToolMetadata): Promise<void> {
@@ -675,35 +696,76 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   }
 }
 
-function parsePlanRecord(request: string, model: string, answer: string): PlanRecord {
+function parsePlanRecord(request: string, model: string, answer: string, inspectionEvents: string[] = []): PlanRecord {
   const now = new Date().toISOString();
+  const summary = sectionText(answer, /summary|摘要/i) || sectionText(answer, /goal|目标/i) || firstContentLine(answer) || "Plan ready.";
   return {
     id: `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     request,
     status: "draft",
     model,
     answer,
+    summary,
     steps: sectionLines(answer, /ordered steps|steps|实施步骤|步骤/i),
     files: sectionLines(answer, /relevant files|files|关键文件|相关文件/i),
-    validations: sectionLines(answer, /validation|验证|test|checks/i),
+    validations: sectionLines(answer, /validation commands|validation|验证|test|checks/i),
     risks: sectionLines(answer, /risks|风险/i),
     openQuestions: sectionLines(answer, /open questions|待确认|问题/i),
+    assumptions: sectionLines(answer, /assumptions|假设/i),
+    acceptanceCriteria: sectionLines(answer, /acceptance criteria|验收|验收标准/i),
+    statusReason: inspectionEvents.length > 0 ? undefined : "limited inspection",
+    inspectionEvents,
     createdAt: now
   };
 }
 
 function sectionLines(answer: string, heading: RegExp): string[] {
+  return sectionBlock(answer, heading)
+    .map((line) => line.replace(/^\s*(?:[-*]|\d+[.)])\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function sectionText(answer: string, heading: RegExp): string {
+  return sectionBlock(answer, heading)
+    .map((line) => line.replace(/^\s*(?:[-*]|\d+[.)])\s*/, "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 240);
+}
+
+function sectionBlock(answer: string, heading: RegExp): string[] {
   const lines = answer.split(/\r?\n/);
-  const start = lines.findIndex((line) => heading.test(line));
+  const start = lines.findIndex((line) => heading.test(cleanHeading(line)));
   if (start === -1) return [];
   const result: string[] = [];
+  const inline = inlineHeadingContent(lines[start], heading);
+  if (inline) result.push(inline);
   for (const line of lines.slice(start + 1)) {
-    if (/^#{1,6}\s+|^[A-Z][A-Za-z ]+:\s*$/.test(line.trim()) && result.length > 0) break;
-    const cleaned = line.replace(/^\s*[-*\d.)]+\s*/, "").trim();
-    if (cleaned) result.push(cleaned);
-    if (result.length >= 12) break;
+    if (isSectionHeading(line) && result.length > 0) break;
+    if (line.trim()) result.push(line);
   }
   return result;
+}
+
+function cleanHeading(line: string): string {
+  return line.trim().replace(/^#{1,6}\s*/, "").replace(/[:：].*$/, "");
+}
+
+function inlineHeadingContent(line: string, heading: RegExp): string {
+  const cleaned = line.trim().replace(/^#{1,6}\s*/, "");
+  const match = cleaned.match(/^([^:：]+)[:：]\s*(.+)$/);
+  if (!match || !heading.test(match[1])) return "";
+  return match[2].trim();
+}
+
+function isSectionHeading(line: string): boolean {
+  const cleaned = line.trim();
+  return /^#{1,6}\s+\S/.test(cleaned) || /^[A-Z][A-Za-z ]+[:：]\s*$/.test(cleaned) || /^[\u4e00-\u9fa5A-Za-z ]{2,20}[:：]\s*$/.test(cleaned);
+}
+
+function firstContentLine(answer: string): string {
+  return answer.split(/\r?\n/).map((line) => line.replace(/^#{1,6}\s*/, "").trim()).find(Boolean) ?? "";
 }
 
 function startNextTodo(task: TaskRecord): void {
@@ -730,10 +792,16 @@ function toolStatus(ok: boolean, errorType: ToolErrorType | undefined, output: s
 }
 
 function approvalMetadata(requirement: import("./types.js").ApprovalRequirement): ToolMetadata {
+  const detail = (label: string) => requirement.details?.find((item) => item.label === label)?.value;
   return {
     approvalKey: requirement.approvalKey,
     scope: requirement.scope,
     riskReason: requirement.riskReason,
+    mode: detail("mode"),
+    action: detail("action"),
+    target: detail("target"),
+    scopeType: detail("scopeType"),
+    rememberPolicy: detail("rememberPolicy"),
     blocked: requirement.blocked,
     rememberable: requirement.rememberable
   };

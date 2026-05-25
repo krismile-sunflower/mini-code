@@ -3,7 +3,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { AgentSession } from "../core/agent.js";
 import { loadProjectMemory } from "../core/memory.js";
 import { SessionStore } from "../storage/sessionStore.js";
-import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval } from "../core/types.js";
+import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval, PlanRecord } from "../core/types.js";
 import type { CliArgs } from "./config.js";
 
 export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSessions: false, newSession: false, legacy: false, piPassThrough: false, piArgs: [] }): Promise<void> {
@@ -20,7 +20,7 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
 
   if (args.planRequest) {
     const plan = await session.createPlan(args.planRequest);
-    output.write(`Plan ${plan.id} created with ${plan.model}\n\n${plan.answer}\n`);
+    output.write(`${formatPlanSummary(plan)}\n\n${plan.answer}\n`);
     rl.close();
     return;
   }
@@ -60,7 +60,8 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
     if (request === "/status") {
       const record = session.getRecord();
       const task = record.tasks?.at(-1);
-      output.write(`session=${session.id}\nmessages=${session.getMessageCount()}\nsummary=${session.getSummary() ? "yes" : "no"}\ntask=${task?.status ?? "none"}\ntools=${task?.toolCalls.length ?? 0}\n`);
+      const plan = record.plans?.at(-1);
+      output.write(`session=${session.id}\nmessages=${session.getMessageCount()}\nsummary=${session.getSummary() ? "yes" : "no"}\ntask=${task?.status ?? "none"}\ntools=${task?.toolCalls.length ?? 0}\nplan=${plan ? `${plan.id} ${plan.status} ${plan.model}${plan.executedAt ? " executed" : ""}` : "none"}\n`);
       continue;
     }
     if (request === "/tools") {
@@ -103,7 +104,7 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
     }
     if (request.startsWith("/plan ")) {
       const plan = await session.createPlan(request.slice("/plan ".length).trim());
-      output.write(`Plan ${plan.id} created. Run /execute ${plan.id} to execute.\n\n${plan.answer}\n`);
+      output.write(`${formatPlanSummary(plan)}\nRun /execute ${plan.id} to execute.\n\n${plan.answer}\n`);
       continue;
     }
     if (request.startsWith("/execute ")) {
@@ -133,6 +134,16 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
   }
 
   rl.close();
+}
+
+function formatPlanSummary(plan: PlanRecord): string {
+  return [
+    `Plan ${plan.id} ready with ${plan.model}`,
+    `status=${plan.status}${plan.statusReason ? ` (${plan.statusReason})` : ""}`,
+    `summary=${plan.summary}`,
+    `files=${plan.files.length ? plan.files.slice(0, 3).join(", ") : "none listed"}`,
+    `steps=${plan.steps.length} risks=${plan.risks.length} acceptance=${plan.acceptanceCriteria.length}`
+  ].join("\n");
 }
 
 async function printSessions(sessionDir: string): Promise<void> {

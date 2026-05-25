@@ -12,7 +12,9 @@ import {
   emptyStates,
   eventToTimelineItems,
   filterCommandsAndSkills,
+  markdownPreview,
   nextPermissionMode,
+  planSummaryRows,
   permissionModeColor,
   permissionModeLabel,
   renderDiffLines,
@@ -20,11 +22,15 @@ import {
   stateColor,
   statusModel,
   timelineLabel,
+  timelineMarkdownLines,
+  timelineRenderBlocks,
   truncateEnd,
   truncateMiddle,
   welcomeTips,
   type StatusModel,
-  type TimelineItem
+  type TimelineItem,
+  type TimelineRenderBlock,
+  type MarkdownLine
 } from "./renderModel.js";
 
 export function App({ config, warnings = [], skills = [] }: { config: AgentConfig; warnings?: string[]; skills?: SkillInfo[] }) {
@@ -45,6 +51,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
   const [permissionMode, setPermissionMode] = useState(activeConfig.permissionMode);
   const [streamingText, setStreamingText] = useState("");
   const [aborting, setAborting] = useState(false);
+  const [commandIndex, setCommandIndex] = useState(0);
   const sessionRef = useRef<AgentSession | undefined>();
 
   const pushItems = (...items: TimelineItem[]) => {
@@ -175,7 +182,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
         const request = trimmed.slice("/plan ".length).trim();
         const plan = await session.createPlan(request);
         setPendingPlan(plan);
-        pushItems({ kind: "session", text: `Plan ${plan.id} ready. Press y to execute, n to cancel, or e to edit request.\n\n${plan.answer}` });
+        pushItems({ kind: "plan_record", plan });
       } else if (trimmed.startsWith("/execute ")) {
         const id = trimmed.slice("/execute ".length).trim();
         pushItems({ kind: "session", text: `Executing plan ${id}` });
@@ -199,6 +206,9 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
       setStreamingText("");
     }
   };
+
+  const commandEntries = useMemo(() => input.startsWith("/") && !input.includes(" ") ? filterCommandsAndSkills(input, skills) : [], [input, skills]);
+  const selectedCommandIndex = commandEntries.length > 0 ? Math.min(commandIndex, commandEntries.length - 1) : 0;
 
   useInput((inputChar, key) => {
     if (key.escape && busy) {
@@ -228,11 +238,24 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
       } else if (inputChar.toLowerCase() === "e") {
         setInput(`/plan ${pendingPlan.request} `);
         setPendingPlan(undefined);
+      } else if (inputChar.toLowerCase() === "d") {
+        setDetailsVisible(true);
       }
       return;
     }
+    if (input.startsWith("/") && !input.includes(" ") && commandEntries.length > 0) {
+      if (key.upArrow) {
+        setCommandIndex((value) => (value <= 0 ? commandEntries.length - 1 : value - 1));
+        return;
+      }
+      if (key.downArrow || (key.tab && !key.shift)) {
+        setCommandIndex((value) => (value + 1) % commandEntries.length);
+        return;
+      }
+    }
     if (key.return) {
-      void submit(input);
+      const selected = input.startsWith("/") && !input.includes(" ") && commandEntries.length > 0 ? commandEntries[selectedCommandIndex]?.command : undefined;
+      void submit(selected && input !== selected ? selected : input);
     } else if (key.shift && key.tab) {
       cyclePermissionMode();
     } else if (key.backspace || key.delete) {
@@ -241,6 +264,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
       exit();
     } else if (inputChar && !key.ctrl && !key.meta) {
       setInput((value) => value + inputChar);
+      setCommandIndex(0);
     }
   });
 
@@ -264,50 +288,57 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <HeaderBar status={status} />
+      {timeline.length === 0 && !streamingText ? <WelcomeScreen status={status} /> : <TimelinePanel items={visibleItems} streamingText={streamingText} expanded={expanded} detailsVisible={detailsVisible} historyMode={historyMode} />}
       {warnings.length > 0 ? <ConfigWarnings warnings={warnings} /> : null}
-      {timeline.length === 0 ? <WelcomeScreen status={status} /> : <TimelinePanel items={visibleItems} expanded={expanded} detailsVisible={detailsVisible} historyMode={historyMode} />}
-      {streamingText ? <StreamingBar text={streamingText} /> : null}
       {detailsVisible && timeline.length > 0 ? <DetailPanel detail={latestDetail} /> : null}
-      {input.startsWith("/") && !input.includes(" ") ? <EnhancedCommandMenu input={input} skills={skills} /> : null}
-      {approval ? <ApprovalPanel approval={approval} /> : pendingPlan ? <PlanApprovalPanel plan={pendingPlan} /> : <InputBar busy={busy} input={input} permissionMode={permissionMode} detailsVisible={detailsVisible} expanded={expanded} aborting={aborting} />}
+      {approval ? <ApprovalPanel approval={approval} /> : pendingPlan ? <PlanApprovalPanel plan={pendingPlan} expanded={expanded} /> : <InputBar busy={busy} input={input} permissionMode={permissionMode} detailsVisible={detailsVisible} expanded={expanded} aborting={aborting} />}
+      {!approval && !pendingPlan && commandEntries.length > 0 ? <EnhancedCommandMenu entries={commandEntries} selectedIndex={selectedCommandIndex} /> : null}
     </Box>
   );
 }
 
-function PlanApprovalPanel({ plan }: { plan: PlanRecord }) {
+function PlanApprovalPanel({ plan, expanded }: { plan: PlanRecord; expanded: boolean }) {
+  const rows = planSummaryRows(plan);
   return (
-    <Box borderStyle="double" borderColor="cyan" paddingX={1} flexDirection="column" marginTop={1}>
-      <Text color="cyan">Plan Ready</Text>
-      <Text>id: {plan.id}</Text>
-      <Text>model: {plan.model}</Text>
-      <Text>{truncateEnd(plan.answer.replace(/\s+/g, " "), 500)}</Text>
-      <Text color="cyan">[y] execute  [n] cancel  [e] edit request</Text>
+    <Box borderStyle="round" borderColor="cyan" paddingX={1} flexDirection="column" marginTop={1}>
+      <Box justifyContent="space-between">
+        <Text color="cyan" bold>Plan ready</Text>
+        <Text color="cyan">{plan.status}</Text>
+      </Box>
+      <Text color="white">{truncateEnd(plan.summary, 110)}</Text>
+      <Box flexDirection="column">
+        {rows.slice(0, 8).map((row) => (
+          <Text key={row.label}><Text color="gray">{row.label}</Text> {truncateEnd(row.value, 96)}</Text>
+        ))}
+      </Box>
+      {expanded ? <MarkdownBlock lines={markdownPreview(plan.answer, true)} accentColor="cyan" /> : null}
+      <Text color="cyan">[y] execute  [n] cancel  [e] edit  [d] details</Text>
     </Box>
   );
 }
 
 function WelcomeScreen({ status }: { status: StatusModel }) {
   return (
-    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="row" marginTop={1} minHeight={11}>
-      <Box flexDirection="column" width={30} marginRight={3}>
-        {asciiArt.map((line, index) => (
-          <Text key={index} color="yellow">{line}</Text>
-        ))}
+    <Box borderStyle="single" borderColor="#c87943" paddingX={1} flexDirection="row" minHeight={8}>
+      <Box flexDirection="column" width={33} alignItems="center" marginRight={2}>
+        <Text color="#c87943">Mini Code v0.1.0</Text>
         <Text color="white" bold>Welcome back!</Text>
-        <Text color="gray">V0.1.0</Text>
-        <Text color="gray">{status.provider} · {truncateEnd(status.model, 28)}</Text>
+        <Text> </Text>
+        {asciiArt.map((line, index) => (
+          <Text key={index} color="#d98255">{line}</Text>
+        ))}
+        <Text color="gray">{truncateEnd(status.model, 20)} · API Usage Billing</Text>
         <Text color="gray">{status.cwd}</Text>
       </Box>
-      <Box flexDirection="column" flexGrow={1}>
-        <Text color="yellow" bold>{welcomeTips.gettingStarted.title}</Text>
+      <Box borderStyle="single" borderTop={false} borderBottom={false} borderRight={false} borderColor="#7b4a34" paddingLeft={1} flexDirection="column" flexGrow={1}>
+        <Text color="#d98255" bold>{welcomeTips.gettingStarted.title}</Text>
         {welcomeTips.gettingStarted.items.map((tip, index) => (
-          <Text key={index} color="gray">· {tip}</Text>
+          <Text key={index} color="white">{truncateEnd(tip, 49)}</Text>
         ))}
         <Text> </Text>
-        <Text color="yellow" bold>{welcomeTips.whatsNew.title}</Text>
+        <Text color="#d98255" bold>{welcomeTips.whatsNew.title}</Text>
         {welcomeTips.whatsNew.items.map((item, index) => (
-          <Text key={index} color="gray">· {item}</Text>
+          <Text key={index} color="gray">{truncateEnd(item, 49)}</Text>
         ))}
       </Box>
     </Box>
@@ -316,12 +347,12 @@ function WelcomeScreen({ status }: { status: StatusModel }) {
 
 function ConfigWarnings({ warnings }: { warnings: string[] }) {
   return (
-    <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column" marginTop={1}>
+    <Box flexDirection="column" marginTop={2} marginBottom={1}>
       {warnings.map((warning, index) => {
         const lines = warning.split("\n");
         const [title, ...rest] = lines;
         return (
-          <Box key={index} flexDirection="column">
+          <Box key={index} flexDirection="column" marginBottom={index === warnings.length - 1 ? 0 : 1}>
             <Text color="yellow" bold>{title}</Text>
             {rest.map((line, lineIndex) => (
               <Text key={lineIndex} color="yellow">{line}</Text>
@@ -333,23 +364,25 @@ function ConfigWarnings({ warnings }: { warnings: string[] }) {
   );
 }
 
-function EnhancedCommandMenu({ input, skills }: { input: string; skills: SkillInfo[] }) {
-  const entries = filterCommandsAndSkills(input, skills);
+function EnhancedCommandMenu({ entries, selectedIndex }: { entries: ReturnType<typeof filterCommandsAndSkills>; selectedIndex: number }) {
   return (
-    <Box borderStyle="single" borderColor="cyan" paddingX={1} flexDirection="column" marginTop={1}>
+    <Box flexDirection="column" marginTop={0} borderStyle="single" borderColor="gray" paddingX={1}>
       <Box justifyContent="space-between">
-        <Text color="cyan" bold>Commands{skills.length > 0 ? ` & Skills (${skills.length})` : ""}</Text>
-        <Text color="gray">{entries.length} matching · press enter to run</Text>
+        <Text color="#d98255" bold>Commands</Text>
+        <Text color="gray">↑/↓ select · enter run</Text>
       </Box>
       {entries.length === 0 ? (
         <Text color="gray">No matching commands</Text>
       ) : (
-        entries.map((entry) => (
+        entries.map((entry, index) => (
           <Box key={entry.command}>
-            <Box width={26}>
-              <Text color="cyan">{truncateEnd(entry.command, 24)}</Text>
+            <Box width={2}>
+              <Text color={index === selectedIndex ? "#d98255" : "gray"}>{index === selectedIndex ? "›" : " "}</Text>
             </Box>
-            <Text color="gray">{truncateEnd(entry.description, 70)}</Text>
+            <Box width={27}>
+              <Text color={index === selectedIndex ? "white" : "#bfc1ff"} bold={index === selectedIndex}>{truncateEnd(entry.command, 25)}</Text>
+            </Box>
+            <Text color="gray">{truncateEnd(entry.description, 62)}</Text>
           </Box>
         ))
       )}
@@ -383,33 +416,64 @@ function CommandMenu() {
   return null;
 }
 
-function TimelinePanel({ items, expanded, detailsVisible, historyMode }: { items: TimelineItem[]; expanded: boolean; detailsVisible: boolean; historyMode: boolean }) {
+function TimelinePanel({ items, streamingText, expanded, detailsVisible, historyMode }: { items: TimelineItem[]; streamingText: string; expanded: boolean; detailsVisible: boolean; historyMode: boolean }) {
+  const blocks = timelineRenderBlocks(items.slice(-24), streamingText, expanded);
   return (
-    <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" minHeight={18} marginTop={1}>
+    <Box flexDirection="column" minHeight={18} marginTop={1}>
       <Box justifyContent="space-between">
-        <Text color="cyan" bold>Conversation</Text>
+        <Text color="#d98255" bold>Conversation</Text>
         <Text color="gray">latest {items.length}  details {detailsVisible ? "on" : "off"}  history {historyMode ? "extended" : "normal"}  diff {expanded ? "expanded" : "compact"}</Text>
       </Box>
-      {items.length === 0 ? <Text color="gray">{emptyStates.timeline}</Text> : items.slice(-24).map((item, index) => <TimelineRow key={`${index}-${item.kind}`} item={item} expanded={expanded} />)}
+      {blocks.length === 0 ? <Text color="gray">{emptyStates.timeline}</Text> : blocks.map((block, index) => <TimelineBlockRow key={`${index}-${block.kind}`} block={block} expanded={expanded} />)}
     </Box>
   );
 }
 
-function TimelineRow({ item, expanded }: { item: TimelineItem; expanded: boolean }) {
+function TimelineBlockRow({ block, expanded }: { block: TimelineRenderBlock; expanded: boolean }) {
+  if (block.kind === "activity") return <ActivityRow block={block} />;
+  return <MessageRow item={block.item} markdown={block.markdown} expanded={expanded} />;
+}
+
+function MessageRow({ item, markdown, expanded }: { item: TimelineItem; markdown?: MarkdownLine[]; expanded: boolean }) {
   const label = timelineLabel(item);
-  const diffPreview = item.kind === "code_change" ? renderDiffLines(item.diff, expanded).slice(0, expanded ? 14 : 6) : [];
+  const diffPreview = item.kind === "code_change" && expanded ? renderDiffLines(item.diff, expanded).slice(0, 14) : [];
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" marginTop={1}>
       <Box>
         <Box width={12}>
           <Text color={label.color}>{truncateEnd(label.marker, 10)}</Text>
         </Box>
         <Text color={label.severity === "muted" ? "gray" : "white"}>{truncateEnd(label.text.replace(/\s+/g, " "), 126)}</Text>
       </Box>
+      {markdown ? (
+        <Box marginLeft={12} flexDirection="column">
+          <MarkdownBlock lines={markdown} accentColor={label.color} />
+        </Box>
+      ) : null}
       {diffPreview.length > 0 ? (
         <Box marginLeft={12} flexDirection="column">
           {diffPreview.map((line, index) => (
             <Text key={`${index}-${line.text}`} color={line.color}>{truncateEnd(line.text, 126)}</Text>
+          ))}
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function ActivityRow({ block }: { block: Extract<TimelineRenderBlock, { kind: "activity" }> }) {
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Box>
+        <Box width={12}>
+          <Text color="gray">▹</Text>
+        </Box>
+        <Text color="gray">{block.summary}</Text>
+      </Box>
+      {block.details.length > 0 ? (
+        <Box marginLeft={12} flexDirection="column">
+          {block.details.map((detail, index) => (
+            <Text key={`${index}-${detail}`} color="gray">{detail}</Text>
           ))}
         </Box>
       ) : null}
@@ -424,7 +488,7 @@ function DetailPanel({ detail }: { detail: ReturnType<typeof detailForItem> }) {
         <Text color={detail?.color ?? "gray"} bold>{detail?.title ?? "Detail"}</Text>
         <Text color="gray">{detail?.type ?? "empty"}</Text>
       </Box>
-      <Text color={detail ? "white" : "gray"}>{detail ? truncateEnd(detail.body, 2200) : emptyStates.detail}</Text>
+      {detail ? <MarkdownBlock lines={markdownPreview(detail.body, true)} accentColor={detail.color} /> : <Text color="gray">{emptyStates.detail}</Text>}
       {detail?.diffLines?.map((line, index) => (
         <Text key={`${index}-${line.text}`} color={line.color}>{line.text}</Text>
       ))}
@@ -434,37 +498,99 @@ function DetailPanel({ detail }: { detail: ReturnType<typeof detailForItem> }) {
 
 function ApprovalPanel({ approval }: { approval: PendingApproval }) {
   const blocked = Boolean(approval.requirement.denied || approval.requirement.blocked);
+  const rows = approvalRows(approval);
+  const scope = rows.find((row) => row.label === "scope")?.value;
+  const command = rows.find((row) => row.label === "command")?.value;
+  const cwd = rows.find((row) => row.label === "cwd")?.value;
+  const riskReason = rows.find((row) => row.label === "riskReason")?.value;
   return (
-    <Box borderStyle="double" borderColor={blocked ? "red" : "yellow"} paddingX={1} flexDirection="column" marginTop={1}>
+    <Box borderStyle="round" borderColor={blocked ? "red" : "yellow"} paddingX={1} flexDirection="column" marginTop={1}>
       <Box justifyContent="space-between">
-        <Text color={blocked ? "red" : "yellow"} bold>{blocked ? "Permission Blocked" : "Permission Required"}</Text>
+        <Text color={blocked ? "red" : "yellow"} bold>{blocked ? "Permission blocked" : "Permission required"}</Text>
         <Text color={blocked ? "red" : "yellow"}>{approval.tool}</Text>
       </Box>
-      <Text>{approval.requirement.reason}</Text>
-      {approvalRows(approval).map((row) => (
-        <Text key={`${row.label}-${row.value}`}>
-          <Text color="gray">{row.label}</Text>: {row.value}
-        </Text>
-      ))}
+      <Text color="white">{approval.description}</Text>
+      <Text color="gray">{approval.requirement.reason}</Text>
+      <Text> </Text>
+      <Box flexDirection="column">
+        <Text><Text color="gray">risk</Text>    <Text color={blocked ? "red" : "yellow"}>{approval.requirement.risk}</Text></Text>
+        {scope ? <Text><Text color="gray">scope</Text>   {scope}</Text> : null}
+        {command ? <Text><Text color="gray">command</Text> <Text color="#bfc1ff">{command}</Text></Text> : null}
+        {cwd ? <Text><Text color="gray">cwd</Text>     {cwd}</Text> : null}
+        {riskReason ? <Text><Text color="gray">why</Text>     {riskReason}</Text> : null}
+      </Box>
+      <Text> </Text>
       <Text color={blocked ? "red" : "yellow"}>{blockedApprovalText(approval)}</Text>
-    </Box>
-  );
-}
-
-function StreamingBar({ text }: { text: string }) {
-  return (
-    <Box borderStyle="single" borderColor="blue" paddingX={1} marginTop={1}>
-      <Text color="blue">▶ </Text>
-      <Text color="white">{text.slice(-300)}</Text>
     </Box>
   );
 }
 
 function InputBar({ busy, input, permissionMode, detailsVisible, expanded, aborting }: { busy: boolean; input: string; permissionMode: StatusModel["permissionMode"]; detailsVisible: boolean; expanded: boolean; aborting: boolean }) {
   return (
-    <Box borderStyle="single" borderColor={busy ? (aborting ? "red" : "blue") : "gray"} paddingX={1} flexDirection="column" marginTop={1}>
-      <Text color={busy ? (aborting ? "red" : "blue") : "cyan"}>{busy ? (aborting ? "aborting..." : "running") : ">"} {input || (busy ? "waiting for model" : "Ask, or type / for commands")}</Text>
-      <Text color="gray">{busy ? (aborting ? "waiting for current operation to stop" : "esc abort") : `shift+tab ${permissionModeLabel(permissionMode)}`}  |  /details {detailsVisible ? "on" : "off"}  |  /expand {expanded ? "on" : "off"}  |  / commands</Text>
+    <Box borderStyle="single" borderLeft={false} borderRight={false} borderBottom={false} borderColor="gray" flexDirection="column" marginTop={1}>
+      <Text color={busy ? (aborting ? "red" : "blue") : "white"}>{busy ? (aborting ? "aborting..." : "running") : "›"} {input || (busy ? "waiting for model" : "Ask, or type / for commands")}</Text>
+      {busy ? <Text color="gray">{aborting ? "waiting for current operation to stop" : "esc abort"}</Text> : null}
+      {!busy && (detailsVisible || expanded || permissionMode !== "default") ? (
+        <Text color="gray">shift+tab {permissionModeLabel(permissionMode)}  |  /details {detailsVisible ? "on" : "off"}  |  /expand {expanded ? "on" : "off"}</Text>
+      ) : null}
     </Box>
+  );
+}
+
+function MarkdownBlock({ lines, accentColor = "cyan" }: { lines: MarkdownLine[]; accentColor?: string }) {
+  return (
+    <Box flexDirection="column">
+      {lines.map((line, index) => (
+        <MarkdownRow key={`${index}-${line.kind}-${line.text}`} line={line} accentColor={accentColor} />
+      ))}
+    </Box>
+  );
+}
+
+function MarkdownRow({ line, accentColor }: { line: MarkdownLine; accentColor: string }) {
+  if (line.kind === "blank") return <Text> </Text>;
+  if (line.kind === "heading") {
+    const prefix = line.level && line.level > 2 ? "### " : line.level === 2 ? "## " : "# ";
+    return <Text color={accentColor} bold>{prefix}{line.text}</Text>;
+  }
+  if (line.kind === "bullet") {
+    return <IndentedText level={line.level}><Text color="gray">• </Text><InlineMarkdown text={line.text} /></IndentedText>;
+  }
+  if (line.kind === "ordered") {
+    return <IndentedText level={line.level}><Text color="gray">{line.text.replace(/\s.+$/, " ")} </Text><InlineMarkdown text={line.text.replace(/^\d+[.)]\s+/, "")} /></IndentedText>;
+  }
+  if (line.kind === "task") {
+    return <IndentedText level={line.level}><Text color={line.checked ? "green" : "gray"}>{line.checked ? "[x] " : "[ ] "}</Text><InlineMarkdown text={line.text} /></IndentedText>;
+  }
+  if (line.kind === "quote") {
+    return <Text color="gray">│ {line.text}</Text>;
+  }
+  if (line.kind === "code") {
+    return <Text color="#bfc1ff">{line.text}</Text>;
+  }
+  if (line.kind === "hr") {
+    return <Text color="gray">{line.text}</Text>;
+  }
+  return <InlineMarkdown text={line.text} />;
+}
+
+function IndentedText({ level = 0, children }: { level?: number; children: React.ReactNode }) {
+  return (
+    <Box marginLeft={level * 2}>
+      <Text>{children}</Text>
+    </Box>
+  );
+}
+
+function InlineMarkdown({ text }: { text: string }) {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
+  return (
+    <Text color="white">
+      {parts.map((part, index) => {
+        if (part.startsWith("`") && part.endsWith("`")) return <Text key={index} color="#bfc1ff">{part.slice(1, -1)}</Text>;
+        if (part.startsWith("**") && part.endsWith("**")) return <Text key={index} bold>{part.slice(2, -2)}</Text>;
+        return <Text key={index}>{part}</Text>;
+      })}
+    </Text>
   );
 }

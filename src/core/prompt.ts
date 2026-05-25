@@ -62,7 +62,7 @@ Rules:
 - Use only the available read-only tools below when workspace context is needed.
 - Prefer read_tree for a quick map, search for symbols/text, show_file_outline for large source files, and read_file/read_many_files for exact context.
 - Do not claim you inspected a file unless a tool result exists in this planning conversation.
-- Final answers must include these sections: Goal, Relevant files, Ordered steps, Validation commands, Risks, Open questions.
+- Final answers must be Markdown and include these sections: Goal, Summary, Relevant files, Ordered steps, Validation commands, Risks, Assumptions, Acceptance criteria, Open questions.
 - Return exactly one JSON object each turn. Do not wrap it in markdown.
 
 Available read-only tools:
@@ -73,7 +73,7 @@ ${skillText ? `${skillText}\n` : ""}
 Decision format:
 {"action":"tool","tool":"read_tree","input":{"path":".","maxDepth":2},"thought":"Map the project before planning."}
 {"action":"tool","tool":"read_file","input":{"path":"src/index.ts"},"thought":"Inspect the entrypoint."}
-{"action":"final","answer":"Goal:\\n...\\n\\nRelevant files:\\n...\\n\\nOrdered steps:\\n...\\n\\nValidation commands:\\n...\\n\\nRisks:\\n...\\n\\nOpen questions:\\n..."}
+{"action":"final","answer":"## Goal\\n...\\n\\n## Summary\\n...\\n\\n## Relevant files\\n- ...\\n\\n## Ordered steps\\n1. ...\\n\\n## Validation commands\\n- ...\\n\\n## Risks\\n- ...\\n\\n## Assumptions\\n- ...\\n\\n## Acceptance criteria\\n- ...\\n\\n## Open questions\\n- ..."}
 `;
 }
 
@@ -102,13 +102,13 @@ export function planRequiredCorrection(userRequest: string): Message {
 export function planModeRequest(userRequest: string): Message {
   return {
     role: "user",
-    content: `Mini Code plan mode. Use only read-only inspection tools if workspace context is needed. Do not edit files and do not run shell commands. Produce a final answer that is a concrete implementation plan with these sections: Goal, Relevant files, Ordered steps, Validation commands, Risks, Open questions. User request: ${userRequest}`
+    content: `Mini Code plan mode. Use only read-only inspection tools if workspace context is needed. Do not edit files and do not run shell commands. Produce a final Markdown implementation plan with these sections: Goal, Summary, Relevant files, Ordered steps, Validation commands, Risks, Assumptions, Acceptance criteria, Open questions. User request: ${userRequest}`
   };
 }
 
 export function executePlanRequest(plan: string, userRequest: string): Message {
   return {
     role: "user",
-    content: `Execute this approved Mini Code plan. Preserve unrelated user changes and ask for permissions when required.\n\nOriginal request:\n${userRequest}\n\nApproved plan:\n${plan}`
+    content: `Execute this approved Mini Code plan. Preserve unrelated user changes and ask for permissions when required.\n\nFollow the approved plan. If you need to deviate from it, explain the reason before acting. If you encounter a risk or scope change not covered by the approved plan, stop and ask the user to confirm before continuing.\n\nOriginal request:\n${userRequest}\n\nApproved plan:\n${plan}`
   };
 }

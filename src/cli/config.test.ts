@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { buildConfig, readArgs } from "./config.js";
+import { buildConfig, collectConfigWarnings, readArgs } from "./config.js";
 
 test("buildConfig reads .mini-code config and env aliases", () => {
   const cwd = mkdtempSync(path.join(tmpdir(), "mini-config-"));
@@ -34,4 +34,15 @@ test("readArgs parses mini shell public flags", () => {
   assert.equal(args.enableSkills, false);
   assert.equal(args.piPassThrough, true);
   assert.deepEqual(args.piArgs, ["--help"]);
+});
+
+test("collectConfigWarnings reports apiKeyHelper and API key conflicts", () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "mini-auth-warning-"));
+  writeFileSync(path.join(cwd, ".env"), "ANTHROPIC_API_KEY=key\nANTHROPIC_AUTH_TOKEN=token\n");
+
+  const warnings = collectConfigWarnings(cwd);
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] ?? "", /apiKeyHelper/);
+  assert.match(warnings[0] ?? "", /ANTHROPIC_API_KEY/);
 });

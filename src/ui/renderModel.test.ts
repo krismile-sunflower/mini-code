@@ -11,19 +11,25 @@ import {
   emptyStates,
   eventToTimelineItems,
   headerFields,
+  asciiArt,
   nextPermissionMode,
   outputPreview,
   piLikeModelEventsToTimeline,
   permissionModeLabel,
+  planSummaryRows,
   renderDiffLines,
   slashCommands,
   stateColor,
   statusModel,
   timelineLabel,
+  timelineMarkdownLines,
+  timelineRenderBlocks,
   todoLabel,
-  toolRequestLabel
+  toolRequestLabel,
+  filterCommandsAndSkills,
+  welcomeTips
 } from "./renderModel.js";
-import type { AgentConfig, PendingApproval } from "../core/types.js";
+import type { AgentConfig, PendingApproval, PlanRecord } from "../core/types.js";
 
 test("eventToTimelineItems splits thought and tool request", () => {
   const items = eventToTimelineItems({
@@ -89,6 +95,8 @@ test("approvalRows includes risk, tool, action, and details", () => {
   assert.ok(rows.some((row) => row.label === "prefix" && row.value === "npm test"));
   assert.ok(rows.some((row) => row.label === "approvalKey" && row.value === "shell:exact:npm test"));
   assert.ok(rows.some((row) => row.label === "scope" && row.value === "npm test"));
+  assert.ok(rows.some((row) => row.label === "scopeType" && row.value === "command prefix"));
+  assert.ok(rows.some((row) => row.label === "rememberPolicy" && row.value === "command prefix"));
   assert.ok(rows.some((row) => row.label === "riskReason" && /Low-risk/.test(row.value)));
 });
 
@@ -98,6 +106,10 @@ test("blockedApprovalText hides allow actions for blocked approvals", () => {
   approval.requirement.denied = true;
   assert.doesNotMatch(blockedApprovalText(approval), /allow once/i);
   assert.match(blockedApprovalText(approval), /Blocked/);
+});
+
+test("blockedApprovalText names the remembered approval scope", () => {
+  assert.match(blockedApprovalText(pendingApproval()), /always allow this command prefix/);
 });
 
 test("eventToTimelineItems maps validation tool results", () => {
@@ -159,6 +171,9 @@ test("timeline labels map high-signal states to stable markers and colors", () =
   assert.equal(timelineLabel({ kind: "tool_result", turn: 1, tool: "read_file", ok: false, output: "bad", status: "validation_error" }).color, "yellow");
   assert.equal(timelineLabel({ kind: "permission", text: "Blocked", risk: "dangerous", blocked: true }).marker, "blocked");
   assert.equal(timelineLabel({ kind: "final", text: "Done" }).color, "green");
+  assert.equal(timelineLabel({ kind: "final", text: "# Done\n\n- item" }).text, "answer");
+  assert.equal(timelineLabel({ kind: "assistant_text", text: "Long markdown" }).text, "message");
+  assert.equal(timelineLabel({ kind: "error", category: "runtime", text: "Boom\nStack line" }).text, "Boom");
   assert.equal(timelineLabel({ kind: "error", category: "runtime", text: "Boom" }).severity, "danger");
 });
 
@@ -198,6 +213,87 @@ test("outputPreview clips long output unless expanded", () => {
   const output = Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n");
   assert.match(outputPreview(output, false), /truncated/);
   assert.doesNotMatch(outputPreview(output, true), /truncated/);
+});
+
+test("timeline markdown expands answers but collapses tools and errors by default", () => {
+  const finalLines = timelineMarkdownLines({ kind: "final", text: "# Answer\n\n- item" }, false);
+  assert.equal(finalLines?.[0]?.kind, "heading");
+  assert.equal(finalLines?.[1]?.kind, "blank");
+  assert.equal(finalLines?.[2]?.kind, "bullet");
+
+  assert.equal(timelineMarkdownLines({ kind: "tool_request", turn: 1, tool: "read_file", description: "Read", input: { path: "package.json" } }, false), undefined);
+  assert.equal(timelineMarkdownLines({ kind: "tool_result", turn: 1, tool: "read_file", ok: true, output: "{\n  \"name\": \"mini\"\n}", status: "ok" }, false), undefined);
+  assert.equal(timelineMarkdownLines({ kind: "error", category: "parse", text: "Unexpected JSON\nposition 1" }, false), undefined);
+
+  const expandedTool = timelineMarkdownLines({ kind: "tool_request", turn: 1, tool: "read_file", description: "Read", input: { path: "package.json" } }, true);
+  assert.equal(expandedTool?.[0]?.kind, "code");
+  assert.match(expandedTool?.map((line) => line.text).join("\n") ?? "", /package\.json/);
+
+  const expandedError = timelineMarkdownLines({ kind: "error", category: "parse", text: "Unexpected JSON\nposition 1" }, true);
+  assert.match(expandedError?.map((line) => line.text).join("\n") ?? "", /Unexpected JSON/);
+});
+
+test("timelineRenderBlocks groups operational activity between messages", () => {
+  const blocks = timelineRenderBlocks([
+    { kind: "user", text: "package.json里面有什么" },
+    { kind: "thinking", turn: 1, text: "Need to inspect package metadata." },
+    { kind: "tool_request", turn: 1, tool: "read_file", description: "Read package.json", input: { path: "package.json" } },
+    { kind: "tool_result", turn: 1, tool: "read_file", ok: true, output: "{\n  \"name\": \"mini-code-agent\"\n}", status: "ok", metadata: { path: "package.json" } },
+    { kind: "tool_request", turn: 1, tool: "run_command", description: "Run npm test", input: { command: "npm test" } },
+    { kind: "tool_result", turn: 1, tool: "run_command", ok: true, output: "passed", status: "ok", metadata: { command: "npm test" } },
+    { kind: "final", text: "# 结果\n\n- name: mini-code-agent" }
+  ], "", false);
+
+  assert.equal(blocks.length, 3);
+  assert.equal(blocks[0]?.kind, "message");
+  assert.equal(blocks[0]?.kind === "message" ? blocks[0].item.kind : undefined, "user");
+  assert.equal(blocks[1]?.kind, "activity");
+  assert.match(blocks[1]?.kind === "activity" ? blocks[1].summary : "", /已探索 1 次/);
+  assert.match(blocks[1]?.kind === "activity" ? blocks[1].summary : "", /已运行 1 条命令/);
+  assert.deepEqual(blocks[1]?.kind === "activity" ? blocks[1].details : [], []);
+  assert.equal(blocks[2]?.kind, "message");
+  assert.equal(blocks[2]?.kind === "message" ? blocks[2].item.kind : undefined, "final");
+  assert.equal(blocks[2]?.kind === "message" ? blocks[2].markdown?.[0]?.kind : undefined, "heading");
+});
+
+test("timelineRenderBlocks keeps errors separate and expands activity details", () => {
+  const blocks = timelineRenderBlocks([
+    { kind: "tool_request", turn: 1, tool: "search", description: "Search source", input: { query: "timeline" } },
+    { kind: "tool_result", turn: 1, tool: "search", ok: true, output: "src/ui/App.tsx", status: "ok" },
+    { kind: "error", category: "parse", text: "Unexpected non-whitespace character after JSON\nposition 180" }
+  ], "正在总结\n- done", true);
+
+  assert.equal(blocks[0]?.kind, "activity");
+  assert.match(blocks[0]?.kind === "activity" ? blocks[0].summary : "", /已探索 1 次/);
+  assert.match(blocks[0]?.kind === "activity" ? blocks[0].details.join("\n") : "", /调用 search/);
+  assert.equal(blocks[1]?.kind, "message");
+  assert.equal(blocks[1]?.kind === "message" ? blocks[1].item.kind : undefined, "error");
+  assert.equal(blocks[2]?.kind, "message");
+  assert.equal(blocks[2]?.kind === "message" ? blocks[2].item.kind : undefined, "assistant_text");
+  assert.match(blocks[2]?.kind === "message" && blocks[2].item.kind === "assistant_text" ? blocks[2].item.text : "", /正在总结/);
+});
+
+test("plan record renders as compact ready message and expands markdown", () => {
+  const plan = planRecord();
+  const compact = timelineRenderBlocks([{ kind: "plan_record", plan }], "", false);
+  assert.equal(compact[0]?.kind, "message");
+  assert.match(compact[0]?.kind === "message" ? timelineLabel(compact[0].item).text : "", /draft/);
+  assert.match(compact[0]?.kind === "message" ? compact[0].markdown?.map((line) => line.text).join("\n") ?? "" : "", /Plan ready/);
+
+  const expanded = timelineRenderBlocks([{ kind: "plan_record", plan }], "", true);
+  assert.match(expanded[0]?.kind === "message" ? expanded[0].markdown?.map((line) => line.text).join("\n") ?? "" : "", /Acceptance criteria/);
+});
+
+test("planSummaryRows exposes review-card counts and detail keeps full plan", () => {
+  const plan = planRecord();
+  const rows = planSummaryRows(plan);
+  assert.ok(rows.some((row) => row.label === "steps" && row.value === "2"));
+  assert.ok(rows.some((row) => row.label === "risks" && row.value === "1"));
+  assert.ok(rows.some((row) => row.label === "files" && /src\/ui\/App\.tsx/.test(row.value)));
+  assert.ok(rows.some((row) => row.label === "accept" && /Plan card/.test(row.value)));
+  const detail = detailForItem({ kind: "plan_record", plan }, true);
+  assert.match(detail?.body ?? "", /Full plan body/);
+  assert.match(detail?.body ?? "", /tool read_file/);
 });
 
 test("statusModel truncates long cwd and session", () => {
@@ -255,6 +351,21 @@ test("command groups keep slash menu stable and grouped", () => {
   assert.match(emptyStates.timeline, /No activity/);
 });
 
+test("welcome model mirrors the compact Claude Code style start screen", () => {
+  assert.ok(asciiArt.length <= 5);
+  assert.equal(welcomeTips.gettingStarted.title, "Tips for getting started");
+  assert.match(welcomeTips.gettingStarted.items[0] ?? "", /\/init/);
+  assert.equal(welcomeTips.whatsNew.title, "What's new");
+});
+
+test("slash filtering prioritizes commands before skill entries", () => {
+  const entries = filterCommandsAndSkills("/ski", [{ name: "skill-generator", description: "Generate a project skill", path: "skills/skill-generator.md", content: "", allowedTools: [], disableModelInvocation: false }]);
+
+  assert.equal(entries[0]?.command, "/skills");
+  assert.equal(entries[1]?.command, "/skill:");
+  assert.equal(entries[2]?.command, "/skill:skill-generator");
+});
+
 function pendingApproval(): PendingApproval {
   return {
     id: "approval-1",
@@ -270,12 +381,38 @@ function pendingApproval(): PendingApproval {
       riskReason: "Low-risk verification command.",
       rememberable: true,
       details: [
+        { label: "mode", value: "default" },
+        { label: "action", value: "shell" },
+        { label: "target", value: "npm test" },
+        { label: "scopeType", value: "command prefix" },
         { label: "cwd", value: "/repo" },
+        { label: "riskReason", value: "Low-risk verification command." },
+        { label: "rememberPolicy", value: "command prefix" },
         { label: "command", value: "npm test" },
         { label: "prefix", value: "npm test" }
       ]
     },
     resolve: () => undefined
+  };
+}
+
+function planRecord(): PlanRecord {
+  return {
+    id: "plan-1",
+    request: "Improve plan mode",
+    status: "draft",
+    model: "planner",
+    answer: "## Goal\nFull plan body\n\n## Acceptance criteria\n- Plan card is compact",
+    summary: "Improve plan review.",
+    steps: ["Inspect plan UI", "Update card"],
+    files: ["src/ui/App.tsx", "src/core/agent.ts"],
+    validations: ["npm run typecheck"],
+    risks: ["Prompt drift"],
+    openQuestions: ["None"],
+    assumptions: ["Session storage stays"],
+    acceptanceCriteria: ["Plan card is compact"],
+    inspectionEvents: ["tool read_file: src/ui/App.tsx", "result read_file: ok"],
+    createdAt: "2026-05-25T00:00:00.000Z"
   };
 }
 

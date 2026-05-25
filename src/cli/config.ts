@@ -130,6 +130,17 @@ export function collectConfigWarnings(cwd: string): string[] {
   const loadedEnv = loadConfigEnvDetailed(cwd);
   const env = loadedEnv.values;
   const warnings: string[] = [];
+  if ((env.ANTHROPIC_AUTH_TOKEN || env.CLAUDE_CODE_OAUTH_TOKEN || env.APIKEYHELPER || env.API_KEY_HELPER) && env.ANTHROPIC_API_KEY) {
+    warnings.push(
+      [
+        "Auth conflict: Both a token (apiKeyHelper) and an API key (ANTHROPIC_API_KEY) are set. This may lead",
+        "  to unexpected behavior.",
+        "  · Trying to use apiKeyHelper? Unset the ANTHROPIC_API_KEY environment variable, or logout",
+        "    then say \"No\" to the API key approval before login.",
+        "  · Trying to use ANTHROPIC_API_KEY? Unset the apiKeyHelper setting.",
+      ].join("\n")
+    );
+  }
   if (env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY) {
     warnings.push(
       [

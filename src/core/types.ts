@@ -114,11 +114,16 @@ export interface PlanRecord {
   status: PlanStatus;
   model: string;
   answer: string;
+  summary: string;
   steps: string[];
   files: string[];
   validations: string[];
   risks: string[];
   openQuestions: string[];
+  assumptions: string[];
+  acceptanceCriteria: string[];
+  statusReason?: string;
+  inspectionEvents: string[];
   createdAt: string;
   approvedAt?: string;
   executedAt?: string;
@@ -146,7 +151,7 @@ export type ToolMetadata = Record<string, string | number | boolean | string[] |
 
 export interface ApprovalContext {
   cwd: string;
-  allowedTools: Set<string>;
+  mode: PermissionMode;
   allowedCommandPrefixes: Set<string>;
   allowedApprovalKeys: Set<string>;
 }

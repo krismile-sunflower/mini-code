@@ -1,7 +1,7 @@
 import path from "node:path";
-import type { AgentConfig, AgentEvent, ApprovalDecision, ModelStreamEvent, PendingApproval, PermissionMode, SkillInfo, TaskTodo, ToolErrorType, ToolMetadata } from "../core/types.js";
+import type { AgentConfig, AgentEvent, ApprovalDecision, ModelStreamEvent, PendingApproval, PermissionMode, PlanRecord, SkillInfo, TaskTodo, ToolErrorType, ToolMetadata } from "../core/types.js";
 
-export type TimelineKind = "user" | "assistant_text" | "plan" | "thinking" | "tool_request" | "permission" | "code_change" | "tool_result" | "final" | "error" | "session" | "compact";
+export type TimelineKind = "user" | "assistant_text" | "plan" | "plan_record" | "thinking" | "tool_request" | "permission" | "code_change" | "tool_result" | "final" | "error" | "session" | "compact";
 export type TimelineSeverity = "muted" | "neutral" | "active" | "success" | "warning" | "danger";
 export type DetailType = "message" | "plan" | "tool" | "code_change" | "permission" | "final" | "error" | "session" | "compact" | "thinking";
 export type CodeChangeStatus = "planned" | "checked" | "applied";
@@ -10,6 +10,7 @@ export type TimelineItem =
   | { kind: "user"; text: string }
   | { kind: "assistant_text"; text: string }
   | { kind: "plan"; turn: number; todos: TaskTodo[] }
+  | { kind: "plan_record"; plan: PlanRecord }
   | { kind: "thinking"; turn: number; text: string }
   | { kind: "tool_request"; turn: number; tool: string; description: string; input: Record<string, unknown> }
   | { kind: "permission"; tool?: string; text: string; decision?: ApprovalDecision; risk?: string; details?: Array<{ label: string; value: string }>; blocked?: boolean; rememberable?: boolean }
@@ -60,6 +61,25 @@ export interface TimelineLabel {
   text: string;
   severity: TimelineSeverity;
 }
+
+export interface PlanSummaryRow {
+  label: string;
+  value: string;
+}
+
+export type MarkdownLineKind = "heading" | "paragraph" | "bullet" | "ordered" | "task" | "quote" | "code" | "hr" | "blank";
+
+export interface MarkdownLine {
+  kind: MarkdownLineKind;
+  text: string;
+  level?: number;
+  checked?: boolean;
+  language?: string;
+}
+
+export type TimelineRenderBlock =
+  | { kind: "message"; item: TimelineItem; markdown?: MarkdownLine[] }
+  | { kind: "activity"; summary: string; details: string[]; items: TimelineItem[] };
 
 export function statusModel(input: {
   config: AgentConfig;
@@ -256,17 +276,18 @@ export function toolRequestLabel(item: Extract<TimelineItem, { kind: "tool_reque
 
 export function timelineLabel(item: TimelineItem): TimelineLabel {
   if (item.kind === "user") return { marker: "user", color: "white", text: item.text, severity: "neutral" };
-  if (item.kind === "assistant_text") return { marker: "assistant", color: "cyan", text: truncateEnd(item.text, 180), severity: "neutral" };
+  if (item.kind === "assistant_text") return { marker: "assistant", color: "cyan", text: "message", severity: "neutral" };
   if (item.kind === "plan") return { marker: "plan", color: "cyan", text: `${item.todos.filter((todo) => todo.status === "completed").length}/${item.todos.length} done`, severity: "active" };
+  if (item.kind === "plan_record") return { marker: "plan", color: "cyan", text: `${item.plan.status} ${truncateEnd(item.plan.summary, 120)}`, severity: item.plan.status === "cancelled" ? "warning" : item.plan.status === "executed" ? "success" : "active" };
   if (item.kind === "thinking") return { marker: "think", color: "gray", text: truncateEnd(item.text, 120), severity: "muted" };
   if (item.kind === "tool_request") return { marker: "tool", color: "blue", text: toolRequestLabel(item), severity: "active" };
   if (item.kind === "code_change") return { marker: "edit", color: item.status === "checked" ? "cyan" : "yellow", text: item.summary, severity: "active" };
   if (item.kind === "tool_result") return { marker: item.status, color: toolResultColor(item.status), text: `${item.tool}${item.metadata ? metadataSummary(item.metadata) : ""}`, severity: toolResultSeverity(item.status) };
   if (item.kind === "permission") return { marker: item.blocked ? "blocked" : "perm", color: item.blocked || item.risk === "dangerous" ? "red" : "yellow", text: item.text, severity: item.blocked || item.risk === "dangerous" ? "danger" : "warning" };
   if (item.kind === "compact") return { marker: "summary", color: "magenta", text: "context compacted", severity: "muted" };
-  if (item.kind === "final") return { marker: "done", color: "green", text: truncateEnd(item.text, 180), severity: "success" };
-  if (item.kind === "session") return { marker: "session", color: "cyan", text: truncateEnd(item.text, 180), severity: "neutral" };
-  return { marker: item.category ? `err:${item.category}` : "error", color: "red", text: item.text, severity: "danger" };
+  if (item.kind === "final") return { marker: "done", color: "green", text: "answer", severity: "success" };
+  if (item.kind === "session") return { marker: "session", color: "cyan", text: truncateEnd(item.text.split(/\r?\n/)[0] ?? "session", 180), severity: "neutral" };
+  return { marker: item.category ? `err:${item.category}` : "error", color: "red", text: truncateEnd(firstLine(item.text), 120), severity: "danger" };
 }
 
 export function detailForItem(item: TimelineItem | undefined, expanded: boolean): DetailModel | undefined {
@@ -290,6 +311,7 @@ export function detailForItem(item: TimelineItem | undefined, expanded: boolean)
     return { title: item.blocked ? "Permission blocked" : "Permission required", color: item.blocked || item.risk === "dangerous" ? "red" : "yellow", type: "permission", body: [item.text, details].filter(Boolean).join("\n\n") };
   }
   if (item.kind === "plan") return { title: "Plan", color: "cyan", type: "plan", body: item.todos.map(todoLabel).join("\n") };
+  if (item.kind === "plan_record") return { title: `Plan ${item.plan.id}`, color: "cyan", type: "plan", body: planDetailBody(item.plan, expanded) };
   if (item.kind === "final") return { title: "Final answer", color: "green", type: "final", body: item.text };
   if (item.kind === "error") return { title: item.category ? `Error: ${item.category}` : "Error", color: "red", type: "error", body: errorDetail(item) };
   if (item.kind === "compact") return { title: "Context summary", color: "magenta", type: "compact", body: outputPreview(item.text, expanded) };
@@ -306,6 +328,136 @@ function errorDetail(item: Extract<TimelineItem, { kind: "error" }>): string {
   return [item.text, suggestions.length ? `Suggestions:\n${suggestions.map((text) => `- ${text}`).join("\n")}` : ""].filter(Boolean).join("\n\n");
 }
 
+export function timelineMarkdownLines(item: TimelineItem, expanded: boolean): MarkdownLine[] | undefined {
+  if (item.kind === "assistant_text" || item.kind === "final" || item.kind === "session" || item.kind === "compact") {
+    return markdownPreview(item.text, expanded);
+  }
+  if (item.kind === "plan") {
+    return parseMarkdown(item.todos.map((todo) => `- ${todo.status === "completed" ? "[x]" : "[ ]"} ${todo.content}`).join("\n"));
+  }
+  if (item.kind === "plan_record") {
+    return expanded ? markdownPreview(item.plan.answer, true) : parseMarkdown(`**Plan ready:** ${item.plan.summary}`);
+  }
+  if (!expanded) return undefined;
+  if (item.kind === "error") return markdownPreview(errorDetail(item), true);
+  if (item.kind === "tool_request") return parseMarkdown(`\`\`\`json\n${JSON.stringify(item.input, null, 2)}\n\`\`\``);
+  if (item.kind === "tool_result" && item.output.trim()) return markdownPreview(item.output, true);
+  if (item.kind === "permission" && item.details?.length) return parseMarkdown(item.details.map((row) => `- **${row.label}:** ${row.value}`).join("\n"));
+  return undefined;
+}
+
+export function timelineRenderBlocks(items: TimelineItem[], streamingText: string, expanded: boolean): TimelineRenderBlock[] {
+  const blocks: TimelineRenderBlock[] = [];
+  let activity: TimelineItem[] = [];
+
+  const flushActivity = () => {
+    if (activity.length === 0) return;
+    blocks.push({
+      kind: "activity",
+      summary: activitySummary(activity),
+      details: expanded ? activityDetails(activity) : [],
+      items: activity
+    });
+    activity = [];
+  };
+
+  for (const item of items) {
+    if (isActivityItem(item)) {
+      activity.push(item);
+      continue;
+    }
+    flushActivity();
+    blocks.push({ kind: "message", item, markdown: timelineMarkdownLines(item, expanded) });
+  }
+
+  flushActivity();
+  if (streamingText.trim()) {
+    blocks.push({
+      kind: "message",
+      item: { kind: "assistant_text", text: streamingText },
+      markdown: markdownPreview(streamingText.slice(expanded ? -4000 : -900), expanded)
+    });
+  }
+  return blocks;
+}
+
+function isActivityItem(item: TimelineItem): boolean {
+  return item.kind === "thinking" || item.kind === "tool_request" || item.kind === "tool_result" || item.kind === "code_change" || item.kind === "permission";
+}
+
+function activitySummary(items: TimelineItem[]): string {
+  let explored = 0;
+  let commands = 0;
+  let edits = 0;
+  let approvals = 0;
+
+  for (const item of items) {
+    if (item.kind === "tool_request") {
+      if (item.tool === "run_command") commands += 1;
+      else if (isExplorationTool(item.tool)) explored += 1;
+    } else if (item.kind === "code_change") {
+      edits += 1;
+    } else if (item.kind === "permission") {
+      approvals += 1;
+    }
+  }
+
+  const parts: string[] = [];
+  if (explored > 0) parts.push(`已探索 ${explored} 次`);
+  if (commands > 0) parts.push(`已运行 ${commands} 条命令`);
+  if (edits > 0) parts.push(`已编辑 ${edits} 处`);
+  if (approvals > 0) parts.push(`需批准 ${approvals} 项`);
+  return parts.length > 0 ? parts.join("，") : `已处理 ${items.length} 项活动`;
+}
+
+function activityDetails(items: TimelineItem[]): string[] {
+  const details: string[] = [];
+  for (const item of items) {
+    if (item.kind === "thinking") {
+      details.push(`思考 ${truncateEnd(item.text.replace(/\s+/g, " "), 120)}`);
+    } else if (item.kind === "tool_request") {
+      details.push(`调用 ${toolRequestLabel(item)}`);
+    } else if (item.kind === "tool_result") {
+      const output = firstLine(item.output);
+      details.push(`${item.status} ${item.tool}${item.metadata ? metadataSummary(item.metadata) : ""}${output ? ` — ${truncateEnd(output, 100)}` : ""}`);
+    } else if (item.kind === "code_change") {
+      details.push(`${item.status} ${item.summary}`);
+    } else if (item.kind === "permission") {
+      details.push(`${item.blocked ? "阻止" : "权限"} ${truncateEnd(item.text.replace(/\s+/g, " "), 120)}`);
+    }
+  }
+  return details;
+}
+
+function isExplorationTool(tool: string): boolean {
+  return ["read_file", "read_many_files", "read_tree", "show_file_outline", "search", "list_files", "git_diff", "list_changed_files"].includes(tool);
+}
+
+export function planSummaryRows(plan: PlanRecord): PlanSummaryRow[] {
+  return [
+    { label: "id", value: plan.id },
+    { label: "status", value: plan.status },
+    { label: "model", value: plan.model },
+    { label: "files", value: plan.files.length ? plan.files.slice(0, 3).join(", ") : "none listed" },
+    { label: "steps", value: String(plan.steps.length) },
+    { label: "risks", value: String(plan.risks.length) },
+    { label: "accept", value: plan.acceptanceCriteria.length ? plan.acceptanceCriteria.slice(0, 2).join("; ") : "none listed" },
+    { label: "inspection", value: plan.statusReason === "limited inspection" ? "limited inspection" : `${plan.inspectionEvents.length} events` }
+  ];
+}
+
+function planDetailBody(plan: PlanRecord, expanded: boolean): string {
+  const meta = [
+    `id: ${plan.id}`,
+    `status: ${plan.status}${plan.statusReason ? ` (${plan.statusReason})` : ""}`,
+    `model: ${plan.model}`,
+    `request: ${plan.request}`,
+    `inspection: ${plan.inspectionEvents.length ? `${plan.inspectionEvents.length} events` : "limited inspection"}`
+  ].join("\n");
+  const inspection = plan.inspectionEvents.length ? `\n\nInspection events:\n${plan.inspectionEvents.map((event) => `- ${event}`).join("\n")}` : "";
+  return `${meta}\n\n${outputPreview(plan.answer, expanded)}${expanded ? inspection : ""}`;
+}
+
 export function outputPreview(output: string, expanded: boolean): string {
   const maxChars = expanded ? 4000 : 700;
   const maxLines = expanded ? 80 : 8;
@@ -313,6 +465,73 @@ export function outputPreview(output: string, expanded: boolean): string {
   const clipped = clippedLines.length > maxChars ? clippedLines.slice(0, maxChars) : clippedLines;
   if (clipped.length < output.length || clippedLines.length < output.length) return `${clipped}\n[truncated, type /expand]`;
   return clipped || "[no output]";
+}
+
+export function markdownPreview(markdown: string, expanded: boolean): MarkdownLine[] {
+  const preview = outputPreview(markdown, expanded);
+  return parseMarkdown(preview);
+}
+
+export function parseMarkdown(markdown: string): MarkdownLine[] {
+  const lines: MarkdownLine[] = [];
+  let inCode = false;
+  let language = "";
+  for (const rawLine of markdown.replace(/\t/g, "  ").split(/\r?\n/)) {
+    const fence = rawLine.match(/^\s*```([\w-]*)\s*$/);
+    if (fence) {
+      inCode = !inCode;
+      language = inCode ? fence[1] ?? "" : "";
+      lines.push({ kind: "code", text: inCode ? `\`\`\`${language}` : "```", language });
+      continue;
+    }
+    if (inCode) {
+      lines.push({ kind: "code", text: rawLine, language });
+      continue;
+    }
+    if (!rawLine.trim()) {
+      lines.push({ kind: "blank", text: "" });
+      continue;
+    }
+    const heading = rawLine.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      lines.push({ kind: "heading", level: heading[1].length, text: heading[2] });
+      continue;
+    }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(rawLine)) {
+      lines.push({ kind: "hr", text: "─".repeat(48) });
+      continue;
+    }
+    const task = rawLine.match(/^(\s*)[-*+]\s+\[([ xX])\]\s+(.+)$/);
+    if (task) {
+      lines.push({ kind: "task", level: indentLevel(task[1]), checked: task[2].toLowerCase() === "x", text: task[3] });
+      continue;
+    }
+    const bullet = rawLine.match(/^(\s*)[-*+]\s+(.+)$/);
+    if (bullet) {
+      lines.push({ kind: "bullet", level: indentLevel(bullet[1]), text: bullet[2] });
+      continue;
+    }
+    const ordered = rawLine.match(/^(\s*)(\d+[.)])\s+(.+)$/);
+    if (ordered) {
+      lines.push({ kind: "ordered", level: indentLevel(ordered[1]), text: `${ordered[2]} ${ordered[3]}` });
+      continue;
+    }
+    const quote = rawLine.match(/^\s*>\s?(.+)$/);
+    if (quote) {
+      lines.push({ kind: "quote", text: quote[1] });
+      continue;
+    }
+    lines.push({ kind: "paragraph", text: rawLine.trimEnd() });
+  }
+  return lines.length > 0 ? lines : [{ kind: "paragraph", text: "[no output]" }];
+}
+
+function indentLevel(value: string): number {
+  return Math.min(4, Math.floor(value.length / 2));
+}
+
+function firstLine(value: string): string {
+  return value.split(/\r?\n/).find((line) => line.trim())?.trim() ?? value.trim();
 }
 
 export function approvalRows(approval: PendingApproval): Array<{ label: string; value: string }> {
@@ -361,7 +580,8 @@ function shortPath(value: string, max: number): string {
 export function blockedApprovalText(approval: PendingApproval): string {
   if (approval.requirement.blocked || approval.requirement.denied) return "Blocked. Change the request or restart with --allow-dangerous when appropriate.";
   if (approval.requirement.rememberable === false) return "[y] allow once  [n] deny";
-  return "[y] allow once  [n] deny  [a] always allow this exact scope";
+  const scopeType = approval.requirement.details?.find((detail) => detail.label === "scopeType")?.value ?? "scope";
+  return `[y] allow once  [n] deny  [a] always allow this ${scopeType}`;
 }
 
 function toolStatus(ok: boolean, output: string, errorType?: ToolErrorType): "ok" | "failed" | "denied" | "blocked" | "validation_error" {
@@ -464,30 +684,24 @@ function dedupeRows(rows: Array<{ label: string; value: string }>): Array<{ labe
 // ── Welcome screen & command completion ──────────────────────────────────────
 
 export const asciiArt: string[] = [
-  "  ╭───────────╮  ",
-  "  │  ◉     ◉  │  ",
-  "  │    ─────  │  ",
-  "  ╰─────┬─────╯  ",
-  "   ╔════╧════╗   ",
-  "   ║         ║   ",
-  "   ╚═════════╝   ",
+  "   ▄▄▄▄▄   ",
+  " ▄███████▄ ",
+  "██ ▀█ █▀ ██",
+  "██▄▄███▄▄██",
+  "  ▀▀ ▀ ▀▀  ",
 ];
 
 export const welcomeTips = {
   gettingStarted: {
     title: "Tips for getting started",
     items: [
-      "Ask a question or describe a coding task",
-      "Run /help to see all available commands",
-      "Use /skills to list available project skills",
-      "Press Shift+Tab to cycle permission mode",
-      "Use /plan <request> to plan before executing",
+      "Run /init to create a CLAUDE.md file with instructions",
     ],
   },
   whatsNew: {
     title: "What's new",
     items: [
-      "Check README.md for the latest updates",
+      "Check the Mini Code changelog for updates",
     ],
   },
 };
@@ -534,5 +748,16 @@ export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[]): Co
   }));
   const all = [...cmdEntries, ...skillEntries];
   if (query === "/") return all.slice(0, 12);
-  return all.filter((entry) => entry.command.startsWith(query)).slice(0, 12);
+  return all
+    .filter((entry) => entry.command.toLowerCase().startsWith(query))
+    .sort((left, right) => {
+      const leftExact = left.command.toLowerCase() === query ? 0 : 1;
+      const rightExact = right.command.toLowerCase() === query ? 0 : 1;
+      if (leftExact !== rightExact) return leftExact - rightExact;
+      const leftSkill = left.command.startsWith("/skill:") ? 1 : 0;
+      const rightSkill = right.command.startsWith("/skill:") ? 1 : 0;
+      if (leftSkill !== rightSkill) return leftSkill - rightSkill;
+      return left.command.localeCompare(right.command);
+    })
+    .slice(0, 12);
 }

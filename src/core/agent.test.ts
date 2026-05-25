@@ -302,7 +302,7 @@ test("AgentSession createPlan uses plan model and read-only tools", async () => 
   const calls: Array<{ body: { model: string; messages: Array<{ role: string; content: string }> } }> = [];
   const responses = [
     '{"action":"tool","tool":"read_file","input":{"path":"README.md"},"thought":"Inspect project context before planning."}',
-    '{"action":"final","answer":"Goal:\\nPlan the requested change.\\n\\nRelevant files:\\n- README.md\\n\\nOrdered steps:\\n- Inspect README.md\\n- Implement the change\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- None known\\n\\nOpen questions:\\n- None"}'
+    '{"action":"final","answer":"## Goal\\nPlan the requested change.\\n\\n## Summary\\nUpdate README safely.\\n\\n## Relevant files\\n- README.md\\n\\n## Ordered steps\\n- Inspect README.md\\n- Implement the change\\n\\n## Validation commands\\n- npm test\\n\\n## Risks\\n- None known\\n\\n## Assumptions\\n- Existing README format stays.\\n\\n## Acceptance criteria\\n- README includes the requested update.\\n\\n## Open questions\\n- None"}'
   ];
   globalThis.fetch = async (_url, init) => {
     calls.push({ body: JSON.parse(String(init?.body)) });
@@ -313,7 +313,10 @@ test("AgentSession createPlan uses plan model and read-only tools", async () => 
     const session = await AgentSession.create(config(dir, { planModel: "planner-model" }), (event) => events.push(event), async () => "allow_once");
     const plan = await session.createPlan("plan README update");
     assert.equal(plan.model, "planner-model");
+    assert.equal(plan.summary, "Update README safely.");
     assert.ok(plan.files.some((file) => /README\.md/.test(file)));
+    assert.ok(plan.acceptanceCriteria.some((item) => /README/.test(item)));
+    assert.ok(plan.inspectionEvents.length >= 2);
     assert.ok(events.some((event) => event.type === "tool_request" && event.tool === "read_file"));
     assert.ok(events.some((event) => event.type === "tool_result" && event.tool === "read_file" && event.ok));
     assert.ok(calls.every((call) => call.body.model === "planner-model"));
@@ -321,6 +324,77 @@ test("AgentSession createPlan uses plan model and read-only tools", async () => 
     assert.match(system, /read-only plan mode/);
     assert.doesNotMatch(system, /apply_patch \[risk=write\]/);
     assert.doesNotMatch(system, /run_command/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession createPlan marks limited inspection when no tools are used", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-limited-"));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: '{"action":"final","answer":"Goal: Plan only\\n\\nSummary: No workspace inspection.\\n\\nRelevant files:\\n- src/index.ts\\n\\nOrdered steps:\\n- Inspect later\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- Limited context\\n\\nAssumptions:\\n- Request is accurate\\n\\nAcceptance criteria:\\n- Plan is reviewable\\n\\nOpen questions:\\n- None"}' } }] });
+  try {
+    const session = await AgentSession.create(config(dir), () => undefined, async () => "allow_once");
+    const plan = await session.createPlan("plan without reading");
+    assert.equal(plan.statusReason, "limited inspection");
+    assert.deepEqual(plan.inspectionEvents, []);
+    assert.equal(plan.summary, "No workspace inspection.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession executePlan rejects cancelled and repeated plans", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-status-"));
+  const originalFetch = globalThis.fetch;
+  const responses = [
+    '{"action":"final","answer":"Goal: Plan\\n\\nSummary: Safe plan.\\n\\nRelevant files:\\n- README.md\\n\\nOrdered steps:\\n- Edit\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- None\\n\\nAssumptions:\\n- None\\n\\nAcceptance criteria:\\n- Done\\n\\nOpen questions:\\n- None"}',
+    '{"action":"final","answer":"Goal: Plan\\n\\nSummary: Execute once.\\n\\nRelevant files:\\n- README.md\\n\\nOrdered steps:\\n- Edit\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- None\\n\\nAssumptions:\\n- None\\n\\nAcceptance criteria:\\n- Done\\n\\nOpen questions:\\n- None"}',
+    '{"action":"plan","todos":[{"content":"Execute approved plan","status":"in_progress"}]}',
+    '{"action":"tool","tool":"read_tree","input":{"path":".","maxDepth":1},"thought":"Inspect before executing."}',
+    '{"action":"final","answer":"executed"}'
+  ];
+  globalThis.fetch = async () => jsonResponse({ choices: [{ message: { content: responses.shift() } }] });
+  try {
+    const session = await AgentSession.create(config(dir), () => undefined, async () => "allow_once");
+    const cancelled = await session.createPlan("cancel this");
+    await session.cancelPlan(cancelled.id);
+    await assert.rejects(() => session.executePlan(cancelled.id), /cancelled/);
+
+    const executable = await session.createPlan("execute this");
+    await session.executePlan(executable.id);
+    await assert.rejects(() => session.executePlan(executable.id), /already been executed/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession executePlan prompt carries approved-plan constraints", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mini-agent-plan-prompt-"));
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ body: { messages: Array<{ role: string; content: string }> } }> = [];
+  const responses = [
+    '{"action":"final","answer":"Goal: Plan\\n\\nSummary: Prompt check.\\n\\nRelevant files:\\n- README.md\\n\\nOrdered steps:\\n- Edit\\n\\nValidation commands:\\n- npm test\\n\\nRisks:\\n- Scope change\\n\\nAssumptions:\\n- None\\n\\nAcceptance criteria:\\n- Done\\n\\nOpen questions:\\n- None"}',
+    '{"action":"plan","todos":[{"content":"Execute approved plan","status":"in_progress"}]}',
+    '{"action":"tool","tool":"read_tree","input":{"path":".","maxDepth":1},"thought":"Inspect before executing."}',
+    '{"action":"final","answer":"executed"}'
+  ];
+  globalThis.fetch = async (_url, init) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return jsonResponse({ choices: [{ message: { content: responses.shift() } }] });
+  };
+  try {
+    const session = await AgentSession.create(config(dir), () => undefined, async () => "allow_once");
+    const plan = await session.createPlan("prompt constraints");
+    await session.executePlan(plan.id);
+    const userMessages = calls.flatMap((call) => call.body.messages.filter((message) => message.role === "user").map((message) => message.content));
+    const executePrompt = userMessages.find((message) => /Execute this approved Mini Code plan/.test(message)) ?? "";
+    assert.match(executePrompt, /Follow the approved plan/);
+    assert.match(executePrompt, /deviate/);
+    assert.match(executePrompt, /risk or scope change/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(dir, { recursive: true, force: true });
@@ -401,8 +475,14 @@ function config(dir: string, overrides: Partial<AgentConfig> = {}): AgentConfig 
 }
 
 function jsonResponse(body: unknown): Response {
-  return new Response(JSON.stringify(body), {
+  const content = (body as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content ?? "";
+  const stream = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}`,
+    "data: [DONE]",
+    ""
+  ].join("\n\n");
+  return new Response(stream, {
     status: 200,
-    headers: { "content-type": "application/json" }
+    headers: { "content-type": "text/event-stream" }
   });
 }

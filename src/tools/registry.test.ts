@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createTools } from "./registry.js";
 import { discoverSkills } from "../core/skills.js";
+import { discoverSubagents } from "../core/subagents.js";
 import { ToolRegistry } from "./toolRegistry.js";
 import type { ToolDefinition } from "../core/types.js";
 
@@ -216,6 +217,50 @@ test("create_skill requires write approval for the skill file", async () => {
     assert.equal(requirement.required, true);
     assert.equal(requirement.risk, "write");
     assert.match(requirement.scope ?? "", /\.mini-code\/skills\/review-helper\/SKILL\.md/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("create_subagent creates a discoverable project subagent", async () => {
+  const dir = await tempDir();
+  try {
+    const tool = requiredTool(dir, "create_subagent");
+    const result = await tool.run({
+      name: "Bug Hunter",
+      description: "Find likely defects before release",
+      instructions: "- Inspect changed files first.\n- Report blockers before polish.",
+      tools: ["Read", "Grep", "Bash"]
+    });
+    const agentPath = path.join(dir, ".mini-code", "agents", "bug-hunter.md");
+    const agents = await discoverSubagents(dir, false);
+
+    assert.equal(result.ok, true);
+    const agentText = await readFile(agentPath, "utf8");
+    assert.match(agentText, /name: bug-hunter/);
+    assert.match(agentText, /tools: Read, Grep, Bash/);
+    assert.match(agentText, /Inspect changed files first/);
+    assert.equal(agents[0]?.name, "bug-hunter");
+    assert.deepEqual(result.metadata?.touchedPaths, [".mini-code/agents/bug-hunter.md"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("create_subagent requires write approval for the agent file", async () => {
+  const dir = await tempDir();
+  try {
+    const tool = requiredTool(dir, "create_subagent");
+    const requirement = tool.requiresApproval({ name: "Bug Hunter" }, {
+      cwd: dir,
+      mode: "default",
+      allowedApprovalKeys: new Set(),
+      allowedCommandPrefixes: new Set()
+    });
+
+    assert.equal(requirement.required, true);
+    assert.equal(requirement.risk, "write");
+    assert.match(requirement.scope ?? "", /\.mini-code\/agents\/bug-hunter\.md/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -104,9 +104,15 @@ class McpServerConnection {
     this.process = undefined;
   }
 
-  shutdown(): void {
-    this.process?.kill();
+  async shutdown(): Promise<void> {
+    const child = this.process;
+    if (!child) return;
     this.process = undefined;
+    child.stdin.end();
+    if (child.exitCode !== null || child.killed) return;
+    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    child.kill();
+    await Promise.race([closed, delay(1_000)]);
   }
 
   private request(method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -219,8 +225,8 @@ export class McpManager extends EventEmitter {
     this.required(server).reconnect();
   }
 
-  shutdown(): void {
-    for (const server of this.servers.values()) server.shutdown();
+  async shutdown(): Promise<void> {
+    await Promise.all(Array.from(this.servers.values()).map((server) => server.shutdown()));
   }
 
   private required(server: string): McpServerConnection {
@@ -232,4 +238,8 @@ export class McpManager extends EventEmitter {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

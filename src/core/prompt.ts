@@ -12,7 +12,7 @@ function renderTools(tools: ToolDefinition[]): string {
     .join("\n");
 }
 
-export function systemPrompt(tools: ToolDefinition[], skills: SkillInfo[] = [], projectMemory = ""): string {
+export function systemPrompt(tools: ToolDefinition[], skills: SkillInfo[] = [], projectMemory = "", outputStyle = ""): string {
   const skillText = renderSkillsForPrompt(skills);
   return `You are Mini Code Agent, a local coding assistant running in a user's workspace.
 
@@ -38,8 +38,9 @@ Work like a careful terminal coding harness:
 - Return exactly one JSON object each turn. Do not wrap it in markdown.
 - Use todo_write to maintain a live task list whenever working on multi-step tasks.
 - If the user asks to create a reusable skill, use the create_skill tool with a concise description and task-specific instructions; if it is unavailable, create .mini-code/skills/<skill-name>/SKILL.md with concise frontmatter and workflow instructions.
+- If the user asks to create a subagent/agent persona, use the create_subagent tool with a concise description and task-specific instructions; if it is unavailable, create .mini-code/agents/<agent-name>.md with Claude-style frontmatter.
 
-${projectMemory ? `## Project Memory (CLAUDE.md)\n\n${projectMemory}\n\n` : ""}Available tools:
+${projectMemory ? `## Project Memory (CLAUDE.md)\n\n${projectMemory}\n\n` : ""}${outputStyle ? `${outputStyle}\n\n` : ""}Available tools:
 ${renderTools(tools)}
 
 ${skillText ? `${skillText}\n` : ""}

@@ -1,20 +1,22 @@
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
 import type { AgentConfig, ConfigSource, ConfigSources, LlmProvider, PermissionMode, ToolsPolicy } from "../core/types.js";
 import { loadConfigEnvDetailed, type EnvMap } from "./env.js";
+import { readProjectConfig } from "../core/projectConfig.js";
 
 export interface CliArgs extends Partial<AgentConfig> {
   listSessions: boolean;
   newSession: boolean;
+  continueSession: boolean;
   legacy: boolean;
   piPassThrough: boolean;
   piArgs: string[];
   planRequest?: string;
   executePlanId?: string;
+  forkSessionId?: string;
 }
 
 export function readArgs(argv = process.argv.slice(2)): CliArgs {
-  const config: CliArgs = { listSessions: false, newSession: false, legacy: false, piPassThrough: false, piArgs: [] };
+  const config: CliArgs = { listSessions: false, newSession: false, continueSession: false, legacy: false, piPassThrough: false, piArgs: [] };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     const next = argv[index + 1];
@@ -26,6 +28,12 @@ export function readArgs(argv = process.argv.slice(2)): CliArgs {
     }
     if (arg === "--cwd" && next) {
       config.cwd = next;
+      index += 1;
+    } else if (arg === "--agent-dir" && next) {
+      config.agentDir = next;
+      index += 1;
+    } else if (arg === "--session-dir" && next) {
+      config.sessionDir = next;
       index += 1;
     } else if (arg === "--model" && next) {
       config.model = next;
@@ -45,8 +53,20 @@ export function readArgs(argv = process.argv.slice(2)): CliArgs {
     } else if (arg === "--session" && next) {
       config.sessionId = next;
       index += 1;
-    } else if (arg === "--new-session") {
+    } else if (arg === "--resume") {
+      if (next && !next.startsWith("--")) {
+        config.sessionId = next;
+        index += 1;
+      } else {
+        config.listSessions = true;
+      }
+    } else if (arg === "--fork" && next) {
+      config.forkSessionId = next;
+      index += 1;
+    } else if (arg === "--new-session" || arg === "--no-session") {
       config.newSession = true;
+    } else if (arg === "--continue") {
+      config.continueSession = true;
     } else if (arg === "--list-sessions") {
       config.listSessions = true;
     } else if (arg === "--plain") {
@@ -80,6 +100,9 @@ export function readArgs(argv = process.argv.slice(2)): CliArgs {
     } else if (arg === "--tool-protocol" && next) {
       config.toolProtocol = parseToolProtocol(next);
       index += 1;
+    } else if (arg === "--output-style" && next) {
+      config.outputStyle = next;
+      index += 1;
     } else if (arg === "--legacy") {
       config.legacy = true;
     }
@@ -101,6 +124,7 @@ export function buildConfig(args: CliArgs): AgentConfig {
   const permissionChoice = select(args.permissionMode, env.MINI_CODE_PERMISSION_MODE, env.MINI_AGENT_PERMISSION_MODE, stringValue(projectConfig.permissionMode));
   const sessionDirChoice = select(args.sessionDir, env.MINI_CODE_SESSION_DIR, env.MINI_AGENT_SESSION_DIR, stringValue(projectConfig.sessionDir));
   const toolsPolicyChoice = select(args.toolsPolicy, env.MINI_CODE_TOOLS_POLICY, stringValue(projectConfig.toolsPolicy));
+  const outputStyleChoice = select(args.outputStyle, env.MINI_CODE_OUTPUT_STYLE, stringValue(projectConfig.outputStyle));
   const configSkills = Array.isArray(projectConfig.skills) ? projectConfig.skills.filter((item): item is string => typeof item === "string") : [];
   const envSkills = splitList(env.MINI_CODE_SKILLS);
   const configFeatures = Array.isArray(projectConfig.featureFlags) ? projectConfig.featureFlags.filter((item): item is string => typeof item === "string") : [];
@@ -114,7 +138,8 @@ export function buildConfig(args: CliArgs): AgentConfig {
     permissionMode: sourceFor(permissionChoice.source, "default"),
     agentDir: sourceFor(agentDirChoice.source, "default"),
     sessionDir: sourceFor(sessionDirChoice.source, "default"),
-    toolsPolicy: sourceFor(toolsPolicyChoice.source, "default")
+    toolsPolicy: sourceFor(toolsPolicyChoice.source, "default"),
+    outputStyle: sourceFor(outputStyleChoice.source, "default")
   };
   return {
     cwd,
@@ -137,6 +162,7 @@ export function buildConfig(args: CliArgs): AgentConfig {
     enableMcp,
     mcpConfigPath: args.mcpConfigPath ?? stringValue(projectConfig.mcpConfigPath),
     toolProtocol: args.toolProtocol ?? parseToolProtocol(stringValue(projectConfig.toolProtocol) ?? "json"),
+    outputStyle: outputStyleChoice.value ?? "default",
     featureFlags: uniqueStrings([...configFeatures, ...envFeatures]),
     maxContextMessages: args.maxContextMessages ?? 40,
     maxToolOutputChars: args.maxToolOutputChars ?? 12_000,
@@ -190,17 +216,6 @@ function uniqueStrings(values: string[]): string[] {
 
 function truthy(value: string | undefined): boolean {
   return value ? ["1", "true", "yes", "on"].includes(value.toLowerCase()) : false;
-}
-
-function readProjectConfig(cwd: string): Record<string, unknown> {
-  const filePath = path.join(cwd, ".mini-code", "config.json");
-  if (!existsSync(filePath)) return {};
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-  } catch {
-    return {};
-  }
 }
 
 function stringValue(value: unknown): string | undefined {

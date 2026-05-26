@@ -29,8 +29,7 @@ test("McpManager lists and calls tools from a stdio server", async () => {
     const result = await manager.callTool("mock", "echo", { text: "hello" });
     assert.deepEqual(result, { content: [{ type: "text", text: "hello" }] });
 
-    manager.shutdown();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await manager.shutdown();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

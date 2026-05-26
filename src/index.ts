@@ -16,7 +16,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const config = buildConfig(args);
+  let config = buildConfig(args);
 
   if (args.listSessions) {
     const sessions = await new SessionStore(config.sessionDir).list();
@@ -24,6 +24,19 @@ async function main(): Promise<void> {
       console.log(`${session.id}\t${session.updatedAt}\t${session.model}\t${session.title}\t${session.summary.slice(0, 80)}`);
     }
     return;
+  }
+
+  if (args.forkSessionId) {
+    const forked = await new SessionStore(config.sessionDir).fork(args.forkSessionId);
+    config = { ...config, sessionId: forked.id };
+    console.log(`forked session: ${args.forkSessionId} -> ${forked.id}`);
+  }
+
+  if (args.continueSession && !config.sessionId) {
+    const latest = await new SessionStore(config.sessionDir).latest();
+    if (!latest) throw new Error("No previous sessions found.");
+    config = { ...config, sessionId: latest.id };
+    console.log(`continued session: ${latest.id}`);
   }
 
   if (!config.apiKey) {

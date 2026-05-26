@@ -1,13 +1,12 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { AgentSession } from "../core/agent.js";
-import { loadProjectMemory } from "../core/memory.js";
 import { SessionStore } from "../storage/sessionStore.js";
 import { renderCommandHelp } from "../ui/renderModel.js";
 import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval, PlanRecord } from "../core/types.js";
 import type { CliArgs } from "./config.js";
 
-export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSessions: false, newSession: false, legacy: false, piPassThrough: false, piArgs: [] }): Promise<void> {
+export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSessions: false, newSession: false, continueSession: false, legacy: false, piPassThrough: false, piArgs: [] }): Promise<void> {
   output.write(`Mini Code Agent\n`);
   output.write(`cwd: ${config.cwd}\n`);
   output.write(`provider: ${config.provider}\n`);
@@ -44,8 +43,20 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       continue;
     }
     if (request === "/memory") {
-      const mem = await loadProjectMemory(currentConfig.cwd);
-      output.write(mem ? `${mem}\n` : "No CLAUDE.md files found.\n");
+      output.write(`${await session.describeMemory()}\n`);
+      continue;
+    }
+    if (request === "/memory list") {
+      output.write(`${await session.describeMemorySources()}\n`);
+      continue;
+    }
+    if (request === "/memory reload") {
+      output.write(`${await session.reloadMemory()}\n`);
+      continue;
+    }
+    if (request.startsWith("/memory add ")) {
+      const { scope, note } = parseMemoryAddRequest(request.slice("/memory add ".length));
+      output.write(`${await session.addMemory(scope, note)}\n`);
       continue;
     }
     if (request === "/init") {
@@ -70,6 +81,23 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       output.write(`${session.describeConfig()}\n`);
       continue;
     }
+    if (request === "/config list") {
+      output.write(`${session.describeProjectConfig()}\n`);
+      continue;
+    }
+    if (request.startsWith("/config get ")) {
+      output.write(`${session.getProjectConfig(request.slice("/config get ".length).trim())}\n`);
+      continue;
+    }
+    if (request.startsWith("/config set ")) {
+      const parsed = parseKeyValue(request.slice("/config set ".length));
+      output.write(`${await session.setProjectConfig(parsed.key, parsed.value)}\n`);
+      continue;
+    }
+    if (request.startsWith("/config unset ")) {
+      output.write(`${await session.unsetProjectConfig(request.slice("/config unset ".length).trim())}\n`);
+      continue;
+    }
     if (request === "/doctor") {
       output.write(`${session.describeDoctor()}\n`);
       continue;
@@ -78,12 +106,72 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       output.write(`${session.describeFeatures()}\n`);
       continue;
     }
+    if (request === "/cost") {
+      output.write(`${session.describeCost()}\n`);
+      continue;
+    }
+    if (request === "/release-notes") {
+      output.write(`${session.describeReleaseNotes()}\n`);
+      continue;
+    }
+    if (request === "/output-style") {
+      output.write(`${session.describeOutputStyle()}\n`);
+      continue;
+    }
+    if (request === "/output-style list") {
+      output.write(`${await session.describeOutputStyles()}\n`);
+      continue;
+    }
+    if (request.startsWith("/output-style set ")) {
+      output.write(`${await session.setOutputStyle(request.slice("/output-style set ".length).trim())}\n`);
+      continue;
+    }
+    if (request.startsWith("/output-style create ")) {
+      const { name, instructions } = parseOutputStyleCreateRequest(request.slice("/output-style create ".length));
+      output.write(`${await session.createOutputStyle(name, instructions)}\n`);
+      continue;
+    }
+    if (request === "/bug" || request.startsWith("/bug ")) {
+      output.write(`${session.describeBugReport(request.startsWith("/bug ") ? request.slice("/bug ".length) : "")}\n`);
+      continue;
+    }
     if (request === "/login") {
       output.write(`${session.describeLogin()}\n`);
       continue;
     }
     if (request === "/tools") {
       output.write(`${session.describeTools()}\n`);
+      continue;
+    }
+    if (request === "/commands") {
+      output.write(`${session.describeCustomCommands()}\n`);
+      continue;
+    }
+    if (request === "/commands reload") {
+      output.write(`${await session.reloadCustomCommands()}\n`);
+      continue;
+    }
+    if (request === "/agents") {
+      output.write(`${session.describeSubagents()}\n`);
+      continue;
+    }
+    if (request === "/agents reload") {
+      output.write(`${await session.reloadSubagents()}\n`);
+      continue;
+    }
+    if (request.startsWith("/agent inspect ")) {
+      output.write(`${session.inspectSubagent(request.slice("/agent inspect ".length).trim())}\n`);
+      continue;
+    }
+    if (request.startsWith("/agent create ")) {
+      const { name, description } = parseSkillCreateRequest(request.slice("/agent create ".length));
+      output.write(`${await session.createSubagent(name, description)}\n`);
+      continue;
+    }
+    if (request.startsWith("/agent:")) {
+      const body = request.slice("/agent:".length).trim();
+      const [name = "", ...rest] = body.split(/\s+/);
+      output.write(`${await session.useSubagent(name, rest.join(" "))}\n`);
       continue;
     }
     if (request === "/capabilities") {
@@ -114,6 +202,31 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       output.write(`${session.describePermissions()}\n`);
       continue;
     }
+    if (request === "/permissions reload") {
+      output.write(`${await session.reloadPermissions()}\n`);
+      continue;
+    }
+    if (request.startsWith("/permissions allow ")) {
+      output.write(`${await session.addPermissionRule("allow", request.slice("/permissions allow ".length))}\n`);
+      continue;
+    }
+    if (request.startsWith("/permissions deny ")) {
+      output.write(`${await session.addPermissionRule("deny", request.slice("/permissions deny ".length))}\n`);
+      continue;
+    }
+    if (request.startsWith("/permissions remove ")) {
+      const { action, matcher } = parsePermissionRemoveRequest(request.slice("/permissions remove ".length));
+      output.write(`${await session.removePermissionRule(action, matcher)}\n`);
+      continue;
+    }
+    if (request === "/hooks") {
+      output.write(`${session.describeHooks()}\n`);
+      continue;
+    }
+    if (request === "/hooks reload") {
+      output.write(`${await session.reloadHooks()}\n`);
+      continue;
+    }
     if (request === "/skills") {
       output.write(`${session.describeSkills()}\n`);
       continue;
@@ -141,20 +254,64 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       output.write(`${session.getSummary() || "[no summary]"}\n`);
       continue;
     }
+    if (request === "/todos") {
+      output.write(`${session.describeTodos()}\n`);
+      continue;
+    }
+    if (request === "/tasks") {
+      output.write(`${session.describeTasks()}\n`);
+      continue;
+    }
     if (request === "/sessions") {
       await printSessions(currentConfig.sessionDir);
       continue;
     }
+    if (request === "/continue") {
+      const latest = await new SessionStore(currentConfig.sessionDir).latest();
+      if (!latest) {
+        output.write("No previous sessions found.\n");
+        continue;
+      }
+      currentConfig = { ...currentConfig, sessionId: latest.id };
+      session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
+      output.write(`continued session: ${session.id}\n`);
+      const capabilityChange = session.getCapabilityChangeSummary();
+      if (capabilityChange) output.write(`${capabilityChange}\n`);
+      continue;
+    }
+    if (request === "/session") {
+      output.write(`${session.describeSession()}\n`);
+      continue;
+    }
+    if (request.startsWith("/name ")) {
+      output.write(`${await session.renameSession(request.slice("/name ".length))}\n`);
+      continue;
+    }
     if (request.startsWith("/rename ")) {
       const title = request.slice("/rename ".length).trim();
-      const renamed = await new SessionStore(currentConfig.sessionDir).rename(session.id, title);
-      output.write(`renamed session: ${renamed.title}\n`);
+      output.write(`${await session.renameSession(title)}\n`);
       continue;
     }
     if (request.startsWith("/export-session ")) {
       const exportPath = request.slice("/export-session ".length).trim();
       const written = await new SessionStore(currentConfig.sessionDir).export(session.id, exportPath);
       output.write(`exported session: ${written}\n`);
+      continue;
+    }
+    if (request.startsWith("/import-session ")) {
+      const importPath = request.slice("/import-session ".length).trim();
+      const imported = await new SessionStore(currentConfig.sessionDir).import(importPath);
+      output.write(`imported session: ${imported.id}\n`);
+      continue;
+    }
+    if (request.startsWith("/delete-session ")) {
+      const id = request.slice("/delete-session ".length).trim();
+      if (id === session.id) {
+        output.write("Cannot delete the active session. Start /new or resume another session first.\n");
+        continue;
+      }
+      const deleted = await new SessionStore(currentConfig.sessionDir).delete(id);
+      output.write(deleted ? `deleted session: ${id}\n` : `session not found: ${id}\n`);
       continue;
     }
     if (request.startsWith("/plan ")) {
@@ -166,10 +323,18 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       await session.executePlan(request.slice("/execute ".length).trim());
       continue;
     }
+    if (request === "/review" || request.startsWith("/review ")) {
+      await session.runReview(request.startsWith("/review ") ? request.slice("/review ".length) : "");
+      continue;
+    }
     if (request === "/new") {
       currentConfig = { ...currentConfig, sessionId: undefined };
       session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
       output.write(`new session: ${session.id}\n`);
+      continue;
+    }
+    if (request === "/resume") {
+      await printSessions(currentConfig.sessionDir);
       continue;
     }
     if (request.startsWith("/resume ")) {
@@ -179,6 +344,23 @@ export async function runPlainCli(config: AgentConfig, args: CliArgs = { listSes
       output.write(`resumed session: ${session.id}\n`);
       const capabilityChange = session.getCapabilityChangeSummary();
       if (capabilityChange) output.write(`${capabilityChange}\n`);
+      continue;
+    }
+    if (request.startsWith("/fork ")) {
+      const id = request.slice("/fork ".length).trim();
+      const forked = await new SessionStore(currentConfig.sessionDir).fork(id);
+      currentConfig = { ...currentConfig, sessionId: forked.id };
+      session = await AgentSession.create(currentConfig, renderEvent, (approval) => askApproval(rl, approval));
+      output.write(`forked session: ${id} -> ${session.id}\n`);
+      continue;
+    }
+    if (request.startsWith("/") && !request.startsWith("/skill:")) {
+      const [nameWithSlash = "", ...rest] = request.split(/\s+/);
+      try {
+        await session.runCustomCommand(nameWithSlash.slice(1), rest.join(" "));
+      } catch (error) {
+        output.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
       continue;
     }
 
@@ -218,6 +400,31 @@ function parseSkillCreateRequest(value: string): { name: string; description: st
   const trimmed = value.trim();
   const [name = "", ...rest] = trimmed.split(/\s+/);
   return { name, description: rest.join(" ") };
+}
+
+function parseKeyValue(value: string): { key: string; value: string } {
+  const trimmed = value.trim();
+  const match = /^(\S+)\s+([\s\S]+)$/.exec(trimmed);
+  if (!match) throw new Error("Usage: /config set <key> <value>");
+  return { key: match[1], value: match[2] };
+}
+
+function parseMemoryAddRequest(value: string): { scope: string; note: string } {
+  const match = /^(\S+)\s+([\s\S]+)$/.exec(value.trim());
+  if (!match) throw new Error("Usage: /memory add <project|local|user> <note>");
+  return { scope: match[1], note: match[2] };
+}
+
+function parseOutputStyleCreateRequest(value: string): { name: string; instructions: string } {
+  const match = /^(\S+)\s+([\s\S]+)$/.exec(value.trim());
+  if (!match) throw new Error("Usage: /output-style create <name> <instructions>");
+  return { name: match[1], instructions: match[2] };
+}
+
+function parsePermissionRemoveRequest(value: string): { action: "allow" | "deny"; matcher: string } {
+  const match = /^(allow|deny)\s+([\s\S]+)$/.exec(value.trim());
+  if (!match) throw new Error("Usage: /permissions remove <allow|deny> <matcher>");
+  return { action: match[1] as "allow" | "deny", matcher: match[2] };
 }
 
 function renderEvent(event: AgentEvent): void {

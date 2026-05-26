@@ -47,17 +47,12 @@ export async function maybeCompactMessages(
   messages: Message[],
   existingSummary: string
 ): Promise<CompactionResult> {
-  // Use token-based threshold instead of raw message count
-  const totalTokens = estimateTotalTokens(messages);
-  // Trigger at 75% of the effective context budget (maxContextMessages * ~150 tokens/msg avg)
-  const tokenThreshold = config.maxContextMessages * 150;
-  const countThreshold = config.maxContextMessages;
-
-  if (totalTokens <= tokenThreshold && messages.length <= countThreshold) {
+  if (!shouldCompactMessages(config, messages)) {
     return { messages, summary: existingSummary, compacted: false };
   }
 
   const system = messages[0];
+  const tokenThreshold = compactionTokenThreshold(config);
   // Keep the most recent ~40% of the token budget as a clean-turn window
   const keepRecentTokens = Math.floor(tokenThreshold * 0.4);
   const cutIndex = findCutPoint(messages, keepRecentTokens);
@@ -102,6 +97,15 @@ export async function maybeCompactMessages(
     summary,
     compacted: true
   };
+}
+
+export function shouldCompactMessages(config: AgentConfig, messages: Message[]): boolean {
+  const totalTokens = estimateTotalTokens(messages);
+  return totalTokens > compactionTokenThreshold(config) || messages.length > config.maxContextMessages;
+}
+
+function compactionTokenThreshold(config: AgentConfig): number {
+  return config.maxContextMessages * 150;
 }
 
 function deterministicSummary(messages: Message[], existingSummary: string): string {

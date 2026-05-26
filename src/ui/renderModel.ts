@@ -1,5 +1,6 @@
 import path from "node:path";
-import type { AgentConfig, AgentEvent, ApprovalDecision, ModelStreamEvent, PendingApproval, PermissionMode, PlanRecord, SkillInfo, TaskTodo, ToolErrorType, ToolMetadata } from "../core/types.js";
+import type { AgentConfig, AgentEvent, ApprovalDecision, CustomCommandInfo, ModelStreamEvent, PendingApproval, PermissionMode, PlanRecord, SkillInfo, TaskTodo, ToolErrorType, ToolMetadata } from "../core/types.js";
+import { releaseNoteHighlights } from "../core/releaseNotes.js";
 
 export type TimelineKind = "user" | "assistant_text" | "plan" | "plan_record" | "thinking" | "tool_request" | "permission" | "code_change" | "tool_result" | "final" | "error" | "session" | "compact";
 export type TimelineSeverity = "muted" | "neutral" | "active" | "success" | "warning" | "danger";
@@ -266,12 +267,12 @@ export function headerFields(status: StatusModel): HeaderField[] {
 }
 
 export const commandGroups: CommandGroup[] = [
-  { title: "Session", commands: ["/help", "/status", "/memory", "/init", "/sessions", "/new", "/resume <id>", "/rename <title>", "/export-session <path>"] },
-  { title: "Work", commands: ["/plan <request>", "/execute <plan-id>", "/tools", "/permissions", "/skills", "/skill inspect <name>", "/skill create <name> [description]", "/skill reload", "/skill:<name> <args>", "/capabilities"] },
+  { title: "Session", commands: ["/help", "/status", "/cost", "/bug [description]", "/release-notes", "/output-style", "/output-style list", "/output-style set <name>", "/output-style create <name> <instructions>", "/memory", "/memory list", "/memory add <scope> <note>", "/memory reload", "/init", "/session", "/sessions", "/continue", "/new", "/resume [id]", "/fork <id>", "/name <title>", "/rename <title>", "/export-session <path>", "/import-session <path>", "/delete-session <id>"] },
+  { title: "Work", commands: ["/review [target]", "/plan <request>", "/execute <plan-id>", "/todos", "/tasks", "/tools", "/permissions", "/permissions allow <matcher>", "/permissions deny <matcher>", "/permissions remove <action> <matcher>", "/permissions reload", "/hooks", "/hooks reload", "/commands", "/commands reload", "/agents", "/agents reload", "/agent inspect <name>", "/agent create <name> [description]", "/agent:<name> <task>", "/skills", "/skill inspect <name>", "/skill create <name> [description]", "/skill reload", "/skill:<name> <args>", "/capabilities"] },
   { title: "MCP", commands: ["/mcp", "/mcp tools", "/mcp resources", "/mcp prompts", "/mcp reconnect <server>"] },
   { title: "View", commands: ["/details", "/expand", "/history", "/clear", "/queue", "/queue clear"] },
   { title: "Context", commands: ["/compact", "/summary"] },
-  { title: "Config", commands: ["/model", "/config", "/doctor", "/features", "/login", "/pi (use --pi-pass-through -- ...)"] },
+  { title: "Config", commands: ["/model", "/config", "/config list", "/config get <key>", "/config set <key> <value>", "/config unset <key>", "/doctor", "/features", "/login", "/pi (use --pi-pass-through -- ...)"] },
   { title: "Exit", commands: ["/exit"] }
 ];
 
@@ -1180,11 +1181,7 @@ export const welcomeTips = {
   },
   whatsNew: {
     title: "What's new",
-    items: [
-      "Improved error messages and recovery",
-      "Improved slash command and skills UI",
-      "Fixed session capability diffs",
-    ],
+    items: releaseNoteHighlights(4),
   },
 };
 
@@ -1205,22 +1202,58 @@ export interface SkillPickerRow {
 export const commandDescriptions: Record<string, string> = {
   "/help": "Show all available commands",
   "/status": "Show session status and configuration",
+  "/cost": "Show estimated session token usage",
+  "/bug": "Prepare a diagnostic bug report",
+  "/release-notes": "Show Mini Code release notes",
+  "/output-style": "Show active response style",
+  "/output-style list": "List built-in and custom response styles",
+  "/output-style set": "Persist and activate an output style",
+  "/output-style create": "Create and activate a project output style",
   "/model": "Show active provider, model, plan model, and tool protocol",
   "/config": "Show resolved Mini Code configuration",
+  "/config list": "Show project config file values",
+  "/config get": "Show one project config value",
+  "/config set": "Persist one project config value",
+  "/config unset": "Remove one project config value",
   "/doctor": "Run local configuration diagnostics",
   "/features": "Show enabled FEATURE_* flags",
   "/login": "Show provider auth setup guidance",
   "/memory": "Show loaded CLAUDE.md project memory",
+  "/memory list": "List user, project, and local memory files",
+  "/memory add": "Append a note to project, local, or user memory",
+  "/memory reload": "Reload memory into the active system prompt",
   "/init": "Generate CLAUDE.md by analysing this repository",
   "/sessions": "List all saved sessions",
+  "/continue": "Resume the most recently updated session",
+  "/session": "Show the current session id and metadata",
   "/new": "Start a new session",
-  "/resume": "Resume a previous session by ID",
+  "/resume": "List sessions, or resume a previous session by ID",
+  "/fork": "Copy a previous session into a new session",
+  "/name": "Rename the current session",
   "/rename": "Rename the current session",
   "/export-session": "Export session history to a file",
+  "/import-session": "Import session history from a JSON file",
+  "/delete-session": "Delete a saved session by id",
   "/plan": "Create a step-by-step plan before coding",
   "/execute": "Execute a previously created plan",
+  "/todos": "Show the latest task todo list",
+  "/tasks": "Show recent session tasks",
+  "/review": "Review code and report findings",
   "/tools": "List all available tools",
   "/permissions": "Show current permission settings",
+  "/permissions allow": "Add a project allow rule",
+  "/permissions deny": "Add a project deny rule",
+  "/permissions remove": "Remove a project permission rule",
+  "/permissions reload": "Reload permission settings",
+  "/hooks": "List configured tool and prompt hooks",
+  "/hooks reload": "Reload hooks from settings files without restarting",
+  "/commands": "List project and user custom slash commands",
+  "/commands reload": "Rediscover custom slash commands without restarting",
+  "/agents": "List discovered project and user subagents",
+  "/agents reload": "Rediscover subagents without restarting",
+  "/agent inspect": "Inspect a subagent manifest",
+  "/agent create": "Create a project subagent",
+  "/agent:": "Run a foreground subagent",
   "/skills": "List discovered project skills",
   "/queue": "Show queued requests",
   "/queue clear": "Clear queued requests",
@@ -1243,9 +1276,13 @@ export const commandDescriptions: Record<string, string> = {
   "/exit": "Exit Mini Code Agent",
 };
 
-export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[]): CommandEntry[] {
+export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[], customCommands: CustomCommandInfo[] = []): CommandEntry[] {
   const query = prefix.toLowerCase();
   const cmdEntries = commandGroups.flatMap((group) => group.commands.map((command) => commandEntry(command)));
+  const customEntries = customCommands.map((command) => ({
+    command: `/${command.name}`,
+    description: `custom ${command.source} - ${command.description}`
+  }));
   const skillEntries = skills.flatMap((skill) => {
     const status = skill.shadowedBy ? "shadowed" : skill.disableModelInvocation ? "disabled" : "default";
     const source = skill.source ?? "project";
@@ -1254,7 +1291,7 @@ export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[]): Co
     if (skill.id !== skill.name) entries.push({ command: `/skill:${skill.id}`, description });
     return entries;
   });
-  const all = [...cmdEntries, ...skillEntries];
+  const all = [...cmdEntries, ...customEntries, ...skillEntries];
   if (query === "/") return all.slice(0, 12);
   return all
     .filter((entry) => commandMatches(entry.command, query))
@@ -1265,6 +1302,9 @@ export function filterCommandsAndSkills(prefix: string, skills: SkillInfo[]): Co
       const leftSkill = left.command.startsWith("/skill:") ? 1 : 0;
       const rightSkill = right.command.startsWith("/skill:") ? 1 : 0;
       if (leftSkill !== rightSkill) return leftSkill - rightSkill;
+      const leftCustom = customEntries.some((entry) => entry.command === left.command) ? 1 : 0;
+      const rightCustom = customEntries.some((entry) => entry.command === right.command) ? 1 : 0;
+      if (leftCustom !== rightCustom) return rightCustom - leftCustom;
       if (leftSkill && rightSkill) {
         const leftExactSkillId = left.command.slice("/skill:".length).includes(":") ? 1 : 0;
         const rightExactSkillId = right.command.slice("/skill:".length).includes(":") ? 1 : 0;
@@ -1326,11 +1366,12 @@ function commandMatches(command: string, query: string): boolean {
 
 function commandKey(command: string): string {
   if (command.startsWith("/skill:")) return "/skill:";
-  return command.replace(/\s+<.*$/, "").replace(/\s+\(.+$/, "");
+  if (command.startsWith("/agent:")) return "/agent:";
+  return command.replace(/\s+<.*$/, "").replace(/\s+\[.*$/, "").replace(/\s+\(.+$/, "");
 }
 
 function normalizeCommandTemplate(command: string): string {
-  return command.replace(/\s+<[^>]+>/g, "");
+  return command.replace(/\s+<[^>]+>/g, "").replace(/\s+\[[^\]]+\]/g, "");
 }
 
 function commandSortKey(command: string): string {

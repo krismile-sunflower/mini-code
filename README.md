@@ -42,6 +42,8 @@ Useful Mini Code capabilities:
 | Native provider tools | `npm run dev -- --tool-protocol native` |
 | Create plan | `npm run dev -- --plain --plan "design the refactor"` |
 | Execute saved plan | `npm run dev -- --plain --execute-plan <plan-id>` |
+| Resume by id | `npm run dev -- --resume <id-or-path>` |
+| Continue latest session | `npm run dev -- --continue` |
 | Pi pass-through | `npm run dev -- --pi-pass-through -- --help` |
 
 Pi package currently installed: `@earendil-works/pi-coding-agent@0.75.5`.
@@ -83,13 +85,42 @@ Mini Shell provides Claude-Code-like workflows through slash commands and hotkey
 | --- | --- |
 | `/help` | Show Mini Code commands. |
 | `/status` | Show effective session/config status. |
+| `/cost` | Show estimated token usage for the current session. |
+| `/bug [description]` | Prepare a diagnostic bug report for sharing. |
+| `/release-notes` | Show recent Mini Code changes. |
+| `/output-style` | Show the active response style. |
+| `/output-style list` | List built-in and custom response styles. |
+| `/output-style set <name>` | Persist and activate a response style. |
+| `/output-style create <name> <instructions>` | Create a project output style and activate it. |
 | `/model` | Show active provider, model, plan model, base URL, and tool protocol. |
 | `/config` | Show resolved Mini Code configuration and config sources. |
+| `/config list` | Show values persisted in `.mini-code/config.json`. |
+| `/config get <key>` | Show one project config value. |
+| `/config set <key> <value>` | Persist one project config value for future sessions. |
+| `/config unset <key>` | Remove one project config value. |
 | `/doctor` | Run local provider/config/MCP/skills diagnostics. |
 | `/features` | Show enabled `FEATURE_*` flags. |
 | `/login` | Show provider authentication setup guidance. |
+| `/memory` | Show loaded user, project, and local `CLAUDE.md` memory. |
+| `/memory list` | Show memory file locations and sizes. |
+| `/memory add <project\|local\|user> <note>` | Append a note to a memory file and reload it into the active session. |
+| `/memory reload` | Reload `CLAUDE.md` memory into the active session without restarting. |
+| `/init` | Generate a project `CLAUDE.md` by inspecting the repository. |
 | `/tools` | Show built-in workspace tools. |
-| `/permissions` | Show permission mode and remembered approvals. |
+| `/permissions` | Show permission mode, remembered approvals, and settings permission rules. |
+| `/permissions allow <matcher>` | Add a project-local permission allow rule. |
+| `/permissions deny <matcher>` | Add a project-local permission deny rule. |
+| `/permissions remove <allow\|deny> <matcher>` | Remove a project-local permission rule. |
+| `/permissions reload` | Reload permission rules without restarting. |
+| `/hooks` | Show configured tool and prompt hooks. |
+| `/hooks reload` | Rediscover hooks from settings files without restarting. |
+| `/commands` | Show discovered custom slash commands. |
+| `/commands reload` | Rediscover custom slash commands without restarting. |
+| `/agents` | Show discovered project and user subagents. |
+| `/agents reload` | Rediscover subagents without restarting. |
+| `/agent inspect <name>` | Inspect a subagent definition. |
+| `/agent create <name> [description]` | Create a project subagent definition. |
+| `/agent:<name> <task>` | Run a foreground subagent with a task. |
 | `/skills` | Show every discovered skill with stable id, source, status, description, and path. |
 | `/skill inspect <name-or-id>` | Show a skill manifest; duplicate names show all candidates and the default. |
 | `/skill create <name> [description]` | Create `.mini-code/skills/<name>/SKILL.md` and reload skills. |
@@ -100,17 +131,24 @@ Mini Shell provides Claude-Code-like workflows through slash commands and hotkey
 | `/mcp resources` | Show resources exposed by configured MCP servers. |
 | `/mcp reconnect <server>` | Restart one MCP server connection. |
 | `/capabilities` | Show the unified capability snapshot. |
+| `/review [target]` | Review code and report findings without editing files. |
 | `/plan <request>` | Create a read-only implementation plan. |
 | `/execute <plan-id>` | Execute an approved/saved plan. |
-| `/resume` | Resume a previous session. |
+| `/todos` | Show the latest task todo list. |
+| `/tasks` | Show recent session tasks and tool counts. |
+| `/resume [id]` | List sessions, or resume a previous session by id. |
+| `/continue` | Resume the most recently updated session. |
 | `/new` | Start a new session. |
-| `/name` | Rename the current session. |
+| `/name <title>` | Rename the current session. |
 | `/session` | Show the current session id. |
 | `/compact` | Compact context. |
 | `/summary` | Show current context summary. |
 | `/sessions` | List local sessions. |
+| `/fork <id>` | Copy a previous session into a new session. |
 | `/rename <title>` | Rename current session. |
 | `/export-session <path>` | Export current session JSON. |
+| `/import-session <path>` | Import session JSON without switching sessions. |
+| `/delete-session <id>` | Delete a saved session by id. |
 | `/quit` | Exit. |
 
 Important Mini Shell hotkeys:
@@ -122,6 +160,146 @@ Important Mini Shell hotkeys:
 
 Mini Code implements its own permission prompts for write, patch, shell, sensitive paths, deletes, and dangerous commands.
 
+Project and user settings can add persistent allow/deny rules. Mini Code reads `permissions.allow` and `permissions.deny` from the same settings files used for hooks: `.mini-code/settings.json`, `.mini-code/settings.local.json`, `.claude/settings.json`, `.claude/settings.local.json`, `~/.mini-code/settings.json`, and `~/.claude/settings.json`.
+
+Use `/permissions allow <matcher>`, `/permissions deny <matcher>`, and `/permissions remove <allow|deny> <matcher>` to edit project-local rules in `.mini-code/settings.local.json` and reload them immediately.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm test)",
+      "Bash(npm run typecheck)",
+      "write_file(src/generated/*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "write_file(.env*)"
+    ]
+  }
+}
+```
+
+`deny` rules take priority over `allow` rules. `allow` rules skip prompts only for otherwise permitted actions; they do not unblock dangerous commands unless Mini Code is started with `--allow-dangerous`.
+
+Permission matchers accept Mini Code tool names and common Claude-style aliases. Examples include `Bash(npm test)`, `Bash(git diff:*)`, `Read(.env*)`, `Edit(src/*.ts)`, `Write(docs/*)`, `Grep(todo)`, and `LS(src)`. `deny` rules also apply to read-only tools that would otherwise run without prompting, so sensitive reads can be blocked from settings.
+
+### Custom Slash Commands
+
+Mini Code discovers project and user custom commands from:
+
+| Location | Notes |
+| --- | --- |
+| `.mini-code/commands/*.md` | Mini Code project commands. |
+| `.claude/commands/*.md` | Claude-style project commands. |
+| `~/.mini-code/commands/*.md` | User Mini Code commands. |
+| `~/.claude/commands/*.md` | User Claude-style commands. |
+
+Each Markdown file becomes a slash command named after its path. For example, `.claude/commands/review.md` becomes `/review`, and `.claude/commands/git/fix.md` becomes `/git/fix`. Running the command injects the Markdown body as instructions and passes trailing text as user arguments through the normal Mini Code agent loop, including planning, permissions, tools, and session recording.
+
+```bash
+/commands
+/commands reload
+/review src/core
+```
+
+Command files may include frontmatter metadata. `description` is shown in `/commands`; frontmatter is removed before the command body is sent to the model. Command bodies support argument placeholders: `$ARGUMENTS` expands to the full trailing text, `$ARGUMENTS[0]` expands to the first parsed argument, and `$1`, `$2`, etc. expand to one-based positional arguments. If no placeholder is present, Mini Code appends the trailing text as user arguments.
+
+### Subagents
+
+Mini Code discovers Claude-style subagents from:
+
+| Location | Notes |
+| --- | --- |
+| `.mini-code/agents/*.md` | Mini Code project subagents. |
+| `.claude/agents/*.md` | Claude-style project subagents. |
+| `~/.mini-code/agents/*.md` | User Mini Code subagents. |
+| `~/.claude/agents/*.md` | User Claude-style subagents. |
+
+Subagent files support frontmatter fields such as `name`, `description`, and `tools`, followed by Markdown instructions. Use `/agents` to list them, `/agent inspect <name>` to inspect one, `/agent create <name> [description]` to scaffold `.mini-code/agents/<name>.md`, `/agents reload` after editing files, and `/agent:<name> <task>` to run a foreground subagent. Mini Code also exposes a model-callable `create_subagent` tool, so natural-language requests such as "create a release review subagent" can create the file through the normal permission and session-recording path. In foreground mode, declared `tools` constrain the tool list shown to the model and Mini Code rejects undeclared tool calls before execution. This foreground mode applies the subagent instructions to the current session and current permission policy; it does not yet create an isolated child context or parallel worktree.
+
+### Hooks
+
+Mini Code can run trusted project or user hook commands from `.mini-code/settings.json`, `.mini-code/settings.local.json`, `.claude/settings.json`, `.claude/settings.local.json`, `~/.mini-code/settings.json`, and `~/.claude/settings.json`.
+
+```bash
+/hooks
+/hooks reload
+```
+
+Example settings:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "node scripts/session-context.js" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node scripts/prompt-context.js" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "read_file",
+        "hooks": [
+          { "type": "command", "command": "node scripts/pre-read.js" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "node scripts/post-tool.js", "timeoutMs": 10000 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node scripts/after-response.js" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "reviewer",
+        "hooks": [
+          { "type": "command", "command": "node scripts/after-subagent.js" }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual",
+        "hooks": [
+          { "type": "command", "command": "node scripts/before-compact.js" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`matcher` supports exact Mini Code tool names such as `read_file` and `run_command`, `*`, regular expressions, and common Claude-style aliases such as `Read` and `Bash`. `SessionStart` runs when a session is created or resumed and can match `startup` or `resume`; successful stdout is loaded as session context. `UserPromptSubmit` runs before a user request is sent to the model; successful stdout is injected as extra context for that request, and failure blocks the request. Tool hook commands run in the workspace after normal tool validation. `PreToolUse` runs before permission approval and can block the tool call before a prompt is shown; `PostToolUse` runs after successful tool execution, and failures are appended as hook warnings. `Stop` runs after a final answer and receives the final answer in hook context; failures are reported without changing the answer. `SubagentStop` runs after a foreground subagent final answer and can match the subagent name. `PreCompact` runs before manual or automatic compaction and can match `manual` or `auto`; failure blocks that compaction. Dangerous command patterns are blocked unless Mini Code is started with `--allow-dangerous`.
+
+Hook commands receive JSON context on stdin and these environment variables: `CLAUDE_PROJECT_DIR`, `MINI_CODE_HOOK_EVENT`, `MINI_CODE_HOOK_TOOL`, `MINI_CODE_HOOK_INPUT`, `MINI_CODE_HOOK_PROMPT`, `MINI_CODE_HOOK_FINAL_ANSWER`, `MINI_CODE_HOOK_SUBAGENT_NAME`, `MINI_CODE_HOOK_TRIGGER`, `MINI_CODE_HOOK_NOTIFICATION_MESSAGE`, `MINI_CODE_HOOK_NOTIFICATION_TITLE`, `MINI_CODE_HOOK_NOTIFICATION_TYPE`, `MINI_CODE_HOOK_OK`, and `MINI_CODE_HOOK_OUTPUT`.
+
+A command hook can also return structured JSON on stdout to block the current action without relying on a nonzero exit code:
+
+```json
+{ "decision": "block", "reason": "explain why the action is blocked" }
+```
+
 ### Config And Diagnostics
 
 Mini Code exposes Claude-Code-style configuration visibility through slash commands:
@@ -129,12 +307,18 @@ Mini Code exposes Claude-Code-style configuration visibility through slash comma
 ```bash
 /model
 /config
+/config list
+/config get model
+/config set model gpt-4.1-mini
+/config unset model
 /doctor
 /features
 /login
+/output-style list
+/output-style set concise
 ```
 
-`/doctor` checks the active API key, base URL, provider, model, session directory, MCP config, skills, and tool protocol. Experimental flags can be enabled with `FEATURE_<NAME>=1`; for example `FEATURE_BUDDY=1` appears as `buddy` in `/features` and `/status`.
+`/config set` writes `.mini-code/config.json` with validated project defaults such as `provider`, `model`, `planModel`, `outputStyle`, `permissionMode`, `toolsPolicy`, `toolProtocol`, `enableSkills`, `enableMcp`, `skills`, and `featureFlags`. Startup configuration changes apply to new sessions or after restart. `/output-style set` updates `outputStyle` and refreshes the active system prompt immediately. `/doctor` checks the active API key, base URL, provider, model, session directory, MCP config, skills, and tool protocol. Experimental flags can be enabled with `FEATURE_<NAME>=1`; for example `FEATURE_BUDDY=1` appears as `buddy` in `/features` and `/status`.
 
 ## Plan Mode
 
@@ -277,8 +461,10 @@ Mini Code Agent keeps a few old flags as aliases so existing commands do not imm
 | --- | --- |
 | `--plain` | Runs the plain Mini Shell. |
 | `--cwd <path>` | Runs Pi with that working directory. |
-| `--new-session` | Translates to `--no-session`. |
-| `--list-sessions` | Translates to `--resume`. |
+| `--new-session` or `--no-session` | Starts a fresh Mini Code session. |
+| `--list-sessions` or `--resume` | Lists saved Mini Code sessions. |
+| `--resume <id-or-path>` | Resumes a saved Mini Code session. |
+| `--session-dir <path>` | Uses a custom Mini Code session directory. |
 | `--plan` | Enables Mini Code plan mode. |
 | `--plan-model <model>` | Uses a planner model for plan mode. |
 | `--execute-plan <id>` | Executes a saved plan in plain mode. |
@@ -324,6 +510,7 @@ The old Mini Code Agent environment variables still work as aliases:
 | `OPENAI_BASE_URL` or `MINI_AGENT_BASE_URL` | Creates a project-local Pi `models.json` override for OpenAI-compatible endpoints. |
 | `MINI_CODE_PLAN_MODE` or `MINI_AGENT_PLAN_MODE` | Enables Mini Code plan mode when set to `true`, `1`, `yes`, or `on`. |
 | `MINI_CODE_PLAN_MODEL` or `MINI_AGENT_PLAN_MODEL` | Selects the model used by plan mode. |
+| `MINI_CODE_OUTPUT_STYLE` | Selects the active built-in or custom output style. |
 | `MINI_CODE_SKILLS` | Comma-separated skill files or directories. |
 | `MINI_CODE_NO_SKILLS` | Disables Mini Shell skills when truthy. |
 
@@ -334,6 +521,7 @@ Example `.mini-code/config.json`:
   "provider": "openai",
   "model": "gpt-4o",
   "planModel": "claude-sonnet-4-5",
+  "outputStyle": "concise",
   "permissionMode": "default",
   "skills": [".claude/skills/code-review"],
   "enableSkills": true
@@ -392,11 +580,14 @@ Useful session commands:
 
 ```bash
 npm run dev -- --resume
+npm run dev -- --continue
 npm run dev -- --session <id-or-path>
 npm run dev -- --fork <id-or-path>
 npm run dev -- --session-dir .mini-code/sessions
 npm run dev -- --no-session
 ```
+
+Inside Mini Code, use `/export-session <path>` to write the active session JSON and `/import-session <path>` to add a saved session JSON to the current session directory. Import preserves the session id and rejects duplicates; use `/fork <path>` when you need a copied session with a new id.
 
 When resuming a session, Mini Code compares the saved capability snapshot with the currently discovered tools, MCP servers, and skills. If capabilities were added or removed, the shell prints a short warning so the model's available actions do not change silently.
 

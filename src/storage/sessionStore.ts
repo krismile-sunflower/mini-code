@@ -26,7 +26,7 @@ export class SessionStore {
   }
 
   async load(id: string): Promise<SessionRecord | undefined> {
-    const filePath = this.filePath(id);
+    const filePath = this.resolveInputPath(id);
     try {
       const text = await fs.readFile(filePath, "utf8");
       return JSON.parse(text) as SessionRecord;
@@ -65,6 +65,10 @@ export class SessionStore {
     return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  async latest(): Promise<SessionSummary | undefined> {
+    return (await this.list())[0];
+  }
+
   async rename(id: string, title: string): Promise<SessionRecord> {
     const record = await this.load(id);
     if (!record) throw new Error(`Session not found: ${id}`);
@@ -82,6 +86,52 @@ export class SessionStore {
     await fs.mkdir(path.dirname(resolved), { recursive: true });
     await fs.writeFile(resolved, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     return resolved;
+  }
+
+  async import(inputPath: string): Promise<SessionRecord> {
+    const resolved = path.resolve(inputPath);
+    const parsed = JSON.parse(await fs.readFile(resolved, "utf8")) as unknown;
+    const record = validateSessionRecord(parsed, resolved);
+    const existing = await this.load(record.id);
+    if (existing) throw new Error(`Session already exists: ${record.id}`);
+    await this.ensure();
+    await fs.writeFile(this.filePath(record.id), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const imported = await this.load(record.id);
+    return imported ?? record;
+  }
+
+  async delete(id: string): Promise<boolean> {
+    if (!id.trim() || id.endsWith(".json") || path.isAbsolute(id) || /[\\/]/.test(id)) {
+      throw new Error("Session delete expects a session id, not a path.");
+    }
+    try {
+      await fs.unlink(this.filePath(id));
+      return true;
+    } catch (error) {
+      const nodeError = error as { code?: string };
+      if (nodeError.code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  async fork(id: string): Promise<SessionRecord> {
+    const record = await this.load(id);
+    if (!record) throw new Error(`Session not found: ${id}`);
+    const now = new Date().toISOString();
+    const next: SessionRecord = {
+      ...record,
+      id: createSessionId(),
+      createdAt: now,
+      updatedAt: now,
+      title: `Fork of ${record.title ?? record.id}`,
+      events: [...record.events],
+      messages: [...record.messages],
+      tasks: [...(record.tasks ?? [])],
+      plans: [...(record.plans ?? [])],
+      capabilities: record.capabilities ? [...record.capabilities] : undefined
+    };
+    await this.save(next);
+    return next;
   }
 
   createRecord(input: { id?: string; cwd: string; provider: SessionRecord["provider"]; model: string; baseUrl: string; messages: Message[]; events?: AgentEvent[]; summary?: string }): SessionRecord {
@@ -105,4 +155,26 @@ export class SessionStore {
   private filePath(id: string): string {
     return path.join(this.sessionDir, `${id}.json`);
   }
+
+  private resolveInputPath(idOrPath: string): string {
+    if (idOrPath.endsWith(".json") || path.isAbsolute(idOrPath) || /[\\/]/.test(idOrPath)) return path.resolve(idOrPath);
+    return this.filePath(idOrPath);
+  }
+}
+
+function validateSessionRecord(value: unknown, source: string): SessionRecord {
+  if (!isRecord(value)) throw new Error(`Invalid session file: ${source}`);
+  const required = ["id", "createdAt", "updatedAt", "cwd", "provider", "model", "baseUrl", "messages", "events", "summary"];
+  for (const key of required) {
+    if (!(key in value)) throw new Error(`Invalid session file: missing ${key}`);
+  }
+  if (typeof value.id !== "string" || !value.id.trim()) throw new Error("Invalid session file: id must be a string.");
+  if (value.id.endsWith(".json") || path.isAbsolute(value.id) || /[\\/]/.test(value.id)) throw new Error("Invalid session file: id must be a session id, not a path.");
+  if (typeof value.provider !== "string" || !["openai", "anthropic"].includes(value.provider)) throw new Error("Invalid session file: unsupported provider.");
+  if (!Array.isArray(value.messages) || !Array.isArray(value.events)) throw new Error("Invalid session file: messages and events must be arrays.");
+  return value as unknown as SessionRecord;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

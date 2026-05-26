@@ -507,11 +507,34 @@ test("permission mode helpers cycle Claude Code style modes", () => {
   assert.equal(nextPermissionMode("bypass_permissions"), "default");
   assert.equal(permissionModeLabel("accept_edits"), "accept edits");
   assert.ok(slashCommands.includes("/permissions"));
+  assert.ok(slashCommands.includes("/cost"));
+  assert.ok(slashCommands.includes("/bug [description]"));
+  assert.ok(slashCommands.includes("/release-notes"));
+  assert.ok(slashCommands.includes("/review [target]"));
+  assert.ok(slashCommands.includes("/session"));
+  assert.ok(slashCommands.includes("/name <title>"));
+  assert.ok(slashCommands.includes("/fork <id>"));
+  assert.ok(slashCommands.includes("/import-session <path>"));
+  assert.ok(slashCommands.includes("/agents"));
+  assert.ok(slashCommands.includes("/agent create <name> [description]"));
+  assert.ok(slashCommands.includes("/agent:<name> <task>"));
 });
 
 test("command groups keep slash menu stable and grouped", () => {
   assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/help")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/cost")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/bug [description]")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/release-notes")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/session")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/name <title>")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/fork <id>")));
+  assert.ok(commandGroups.some((group) => group.title === "Session" && group.commands.includes("/import-session <path>")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/permissions")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/review [target]")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/commands")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/agents")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/agent create <name> [description]")));
+  assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/agent:<name> <task>")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/skills")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/plan <request>")));
   assert.ok(commandGroups.some((group) => group.title === "Work" && group.commands.includes("/skill create <name> [description]")));
@@ -529,10 +552,27 @@ test("renderCommandHelp shows grouped command descriptions", () => {
   assert.match(help, /Session:/);
   assert.match(help, /Work:/);
   assert.match(help, /Config:/);
+  assert.match(help, /\/cost\s+Show estimated session token usage/);
+  assert.match(help, /\/bug \[description\]\s+Prepare a diagnostic bug report/);
+  assert.match(help, /\/release-notes\s+Show Mini Code release notes/);
   assert.match(help, /\/doctor\s+Run local configuration diagnostics/);
+  assert.match(help, /\/commands\s+List project and user custom slash commands/);
+  assert.match(help, /\/agents\s+List discovered project and user subagents/);
+  assert.match(help, /\/agent create <name> \[description\]\s+Create a project subagent/);
+  assert.match(help, /\/agent:<name> <task>\s+Run a foreground subagent/);
   assert.match(help, /\/skills\s+List discovered project skills/);
   assert.match(help, /\/skill create <name> \[description\]\s+Create a project skill/);
   assert.match(help, /\/skill:<name> <args>\s+Run a named skill/);
+  assert.match(help, /\/review \[target\]\s+Review code and report findings/);
+  assert.match(help, /\/todos\s+Show the latest task todo list/);
+  assert.match(help, /\/tasks\s+Show recent session tasks/);
+  assert.match(help, /\/session\s+Show the current session id and metadata/);
+  assert.match(help, /\/continue\s+Resume the most recently updated session/);
+  assert.match(help, /\/resume \[id\]\s+List sessions, or resume a previous session by ID/);
+  assert.match(help, /\/fork <id>\s+Copy a previous session into a new session/);
+  assert.match(help, /\/import-session <path>\s+Import session history from a JSON file/);
+  assert.match(help, /\/delete-session <id>\s+Delete a saved session by id/);
+  assert.match(help, /\/name <title>\s+Rename the current session/);
 });
 
 test("welcome model mirrors the compact Claude Code style start screen", () => {
@@ -540,6 +580,7 @@ test("welcome model mirrors the compact Claude Code style start screen", () => {
   assert.equal(welcomeTips.gettingStarted.title, "Tips for getting started");
   assert.match(welcomeTips.gettingStarted.items[0] ?? "", /\/init/);
   assert.equal(welcomeTips.whatsNew.title, "What's new");
+  assert.ok(welcomeTips.whatsNew.items.length > 0);
 });
 
 test("slash filtering prioritizes commands before skill entries", () => {
@@ -552,6 +593,13 @@ test("slash filtering prioritizes commands before skill entries", () => {
   assert.equal(entries[4]?.command, "/skill:<name> <args>");
   assert.equal(entries[5]?.command, "/skill:skill-generator");
   assert.match(entries[5]?.description ?? "", /default project:project:skill-generator/);
+});
+
+test("slash filtering includes custom commands", () => {
+  const entries = filterCommandsAndSkills("/rev", [], [{ id: "project:review", name: "review", description: "Review current changes", path: ".claude/commands/review.md", source: "project", content: "Review" }]);
+
+  assert.equal(entries[0]?.command, "/review");
+  assert.match(entries[0]?.description ?? "", /custom project/);
 });
 
 test("slash filtering supports subcommands and exact skill ids", () => {
@@ -655,6 +703,7 @@ function config(): AgentConfig {
     toolsPolicy: "default",
     skills: [],
     enableSkills: true,
+    outputStyle: "default",
     maxContextMessages: 40,
     maxToolOutputChars: 12_000,
     plain: false

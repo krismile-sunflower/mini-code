@@ -1,11 +1,18 @@
-import { maybeCompactMessages } from "./compaction.js";
+import { maybeCompactMessages, shouldCompactMessages } from "./compaction.js";
 import { renderCapabilityList, renderTable } from "./capabilities.js";
+import { discoverCustomCommands, renderCustomCommandList, renderCustomCommandPrompt, resolveCustomCommand } from "./customCommands.js";
 import { parseDecision } from "./decision.js";
 import { DenialTracker } from "./denial.js";
-import { loadProjectMemory } from "./memory.js";
+import { hookRows, loadHookConfig, runHookEvent, type HookConfig } from "./hooks.js";
+import { addSettingsPermissionRule, applySettingsPermissions, loadProjectSettings, removeSettingsPermissionRule, type ProjectSettings } from "./settings.js";
+import { appendProjectMemory, loadProjectMemory, loadProjectMemorySources, parseMemoryScope, renderMemorySources } from "./memory.js";
+import { createProjectOutputStyle, discoverOutputStyles, outputStylePrompt, renderOutputStyleList, resolveOutputStyle, type OutputStyleInfo } from "./outputStyles.js";
 import { fallbackReadFilePath, finalClaimsToolUse, requiresPlan, requiresWorkspaceTool } from "./policy.js";
+import { configurableKeys, formatConfigValue, getProjectConfigValue, renderProjectConfig, setProjectConfigValue, unsetProjectConfigValue } from "./projectConfig.js";
+import { renderReleaseNotes } from "./releaseNotes.js";
 import { executePlanRequest, planModeRequest, planRequiredCorrection, planSystemPrompt, repairPrompt, systemPrompt, toolRequiredCorrection } from "./prompt.js";
 import { createProjectSkill, defaultSkills, discoverSkills, renderSkillInspect, renderSkillList, resolveSkill, skillInjection } from "./skills.js";
+import { createProjectSubagent, discoverSubagents, renderSubagentInspect, renderSubagentList, resolveSubagent, subagentInjection, subagentToolNames } from "./subagents.js";
 import { complete } from "../providers/llm.js";
 import { commandPrefix, commandPrefixApprovalKey } from "../tools/permissions.js";
 import { SessionStore } from "../storage/sessionStore.js";
@@ -30,8 +37,11 @@ import type {
   PlanRecord,
   ToolErrorType,
   ToolMetadata,
+  ToolResult,
   ToolDefinition,
   SkillInfo,
+  CustomCommandInfo,
+  SubagentInfo,
   CapabilityDescriptor
 } from "./types.js";
 
@@ -81,6 +91,12 @@ export class AgentSession {
   private permissionMode: PermissionMode;
   private abortController: AbortController | null;
   private activeSkills: string[] = [];
+  private customCommands: CustomCommandInfo[] = [];
+  private subagents: SubagentInfo[] = [];
+  private activeSubagentName: string | undefined;
+  private activeSubagentToolNames: Set<string> | undefined;
+  private activeSubagentSystemPrompt: Message | undefined;
+  private outputStyle: OutputStyleInfo;
   private readonly capabilityChangeSummary: string;
   private readonly denialTracker = new DenialTracker();
 
@@ -94,6 +110,9 @@ export class AgentSession {
     private readonly onApproval: ApprovalHandler,
     toolList: ToolDefinition[],
     private skills: SkillInfo[],
+    private hooks: HookConfig,
+    private settings: ProjectSettings,
+    outputStyle: OutputStyleInfo,
     capabilities: CapabilityDescriptor[],
     toolDescriptions: string,
     mcpManager: McpManager | undefined,
@@ -101,6 +120,7 @@ export class AgentSession {
   ) {
     this.abortController = null;
     this.tools = new Map(toolList.map((tool) => [tool.name, tool]));
+    this.outputStyle = outputStyle;
     this.capabilities = capabilities;
     this.toolDescriptions = toolDescriptions;
     this.mcpManager = mcpManager;
@@ -131,11 +151,16 @@ export class AgentSession {
     const capabilities = registry.capabilities(config.toolsPolicy);
     const toolDescriptions = registry.describeTools(config.toolsPolicy);
     const skills = await discoverSkills(config.cwd, config.skills, config.enableSkills, { includeGlobal: config.includeGlobalSkills });
+    const customCommands = await discoverCustomCommands(config.cwd, config.includeGlobalSkills !== false);
+    const subagents = await discoverSubagents(config.cwd, config.includeGlobalSkills !== false);
+    const hooks = await loadHookConfig(config.cwd, config.includeGlobalSkills !== false);
+    const settings = await loadProjectSettings(config.cwd, config.includeGlobalSkills !== false);
     const projectMemory = await loadProjectMemory(config.cwd);
+    const outputStyle = await resolveOutputStyle(config.cwd, config.outputStyle, config.includeGlobalSkills !== false);
     const store = new SessionStore(config.sessionDir);
     await store.ensure();
     const loaded = config.sessionId ? await store.load(config.sessionId) : undefined;
-    const messages = loaded?.messages ?? [{ role: "system", content: systemPrompt(toolList, skills, projectMemory) }];
+    const messages = loaded?.messages ?? [{ role: "system", content: systemPrompt(toolList, skills, projectMemory, outputStylePrompt(outputStyle)) }];
     const record =
       loaded ??
       store.createRecord({
@@ -146,7 +171,10 @@ export class AgentSession {
         baseUrl: config.baseUrl,
         messages
       });
-    const session = new AgentSession(config, onEvent, onApproval, toolList, skills, capabilities, toolDescriptions, mcpManager, record);
+    const session = new AgentSession(config, onEvent, onApproval, toolList, skills, hooks, settings, outputStyle, capabilities, toolDescriptions, mcpManager, record);
+    session.customCommands = customCommands;
+    session.subagents = subagents;
+    await session.runSessionStartHooks(loaded ? "resume" : "startup");
     await session.persist();
     return session;
   }
@@ -155,7 +183,19 @@ export class AgentSession {
     this.abortController = new AbortController();
     const task = createTask(userRequest);
     this.record.tasks = [...(this.record.tasks ?? []), task];
-    this.messages.push({ role: "user", content: userRequest });
+    const promptHook = await this.runUserPromptSubmitHooks(userRequest);
+    if (!promptHook.ok) {
+      task.status = "failed";
+      task.error = promptHook.output;
+      touchTask(task);
+      await this.emit({ type: "error", category: promptHook.errorType === "permission_blocked" ? "permission" : "runtime", error: promptHook.output });
+      await this.persist();
+      return promptHook.output;
+    }
+    const effectiveRequest = promptHook.output.trim()
+      ? `${userRequest}\n\n<context from UserPromptSubmit hook>\n${promptHook.output.trimEnd()}\n</context from UserPromptSubmit hook>`
+      : userRequest;
+    this.messages.push({ role: "user", content: effectiveRequest });
     this.record = {
       ...this.record,
       title: this.record.title || titleFromRequest(userRequest),
@@ -235,6 +275,8 @@ export class AgentSession {
         task.finalAnswer = answer;
         completeActiveTodo(task);
         touchTask(task);
+        await this.runStopHooks(answer);
+        await this.runSubagentStopHooks(answer);
         await this.emit({ type: "final", answer });
         await this.persist();
         return answer;
@@ -405,12 +447,18 @@ export class AgentSession {
         }));
         touchTask(task);
         await this.emit({ type: "plan", turn, todos: task.todos });
-        const result = await tool.run(input);
+        const result = await this.runToolWithPostHooks(tool, input);
         await this.recordToolResult(task, turn, tool.name, result.ok, result.output, result.errorType, result.metadata);
         return true;
       }
 
-      const requirement = tool.requiresApproval(input, this.approvalContext);
+      const pre = await this.runPreToolUseHooks(tool, input);
+      if (!pre.ok) {
+        await this.recordToolResult(task, turn, tool.name, false, pre.output, pre.errorType, pre.metadata);
+        return true;
+      }
+
+      const requirement = applySettingsPermissions(tool.requiresApproval(input, this.approvalContext), this.settings.permissions, tool.name, input);
       if (requirement.required) {
         task.status = "waiting_permission";
         touchTask(task);
@@ -421,6 +469,10 @@ export class AgentSession {
           await this.recordToolResult(task, turn, tool.name, false, requirement.reason, "permission_blocked", approvalMetadata(requirement));
           return true;
         }
+        if (pre.metadata?.hookDecision === "approve") {
+          this.denialTracker.reset(requirement.approvalKey ?? requirement.allowAlwaysKey ?? `${tool.name}:${description}`);
+        } else {
+        await this.runNotificationHooks("permission_required", "Permission required", requirement.reason);
         const approvalId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const denialKey = requirement.approvalKey ?? requirement.allowAlwaysKey ?? `${tool.name}:${description}`;
         const decisionResult = await this.onApproval({
@@ -446,15 +498,145 @@ export class AgentSession {
         }
         this.denialTracker.reset(denialKey);
         this.rememberApproval(tool.name, input, requirement.allowAlwaysKey, decisionResult);
+        }
       }
 
-      const result = await tool.run(input);
+      const result = await this.runToolWithPostHooks(tool, input);
       await this.recordToolResult(task, turn, tool.name, result.ok, result.output, result.errorType, result.metadata);
       if (result.ok && tool.name === "create_skill") await this.refreshSkillContext();
+      if (result.ok && tool.name === "create_subagent") await this.refreshSubagents();
       return true;
   }
 
+  private async runUserPromptSubmitHooks(prompt: string): Promise<ToolResult> {
+    return runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "UserPromptSubmit",
+      prompt,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+  }
+
+  private async runSessionStartHooks(source: "startup" | "resume"): Promise<void> {
+    const result = await runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "SessionStart",
+      sessionId: this.id,
+      source,
+      matcherTarget: source,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+    if (!result.ok) {
+      await this.emit({ type: "error", category: result.errorType === "permission_blocked" ? "permission" : "runtime", error: result.output });
+      return;
+    }
+    if (!result.output.trim()) return;
+    this.messages.push({
+      role: "user",
+      content: `<context from SessionStart hook source="${source}">\n${result.output.trimEnd()}\n</context from SessionStart hook>`
+    });
+  }
+
+  private async runStopHooks(finalAnswer: string): Promise<void> {
+    const result = await runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "Stop",
+      sessionId: this.id,
+      finalAnswer,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+    if (!result.ok) {
+      await this.emit({ type: "error", category: result.errorType === "permission_blocked" ? "permission" : "runtime", error: result.output });
+    }
+  }
+
+  private async runSubagentStopHooks(finalAnswer: string): Promise<void> {
+    if (!this.activeSubagentName) return;
+    const result = await runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "SubagentStop",
+      sessionId: this.id,
+      matcherTarget: this.activeSubagentName,
+      subagentName: this.activeSubagentName,
+      finalAnswer,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+    if (!result.ok) {
+      await this.emit({ type: "error", category: result.errorType === "permission_blocked" ? "permission" : "runtime", error: result.output });
+    }
+  }
+
+  private async runPreCompactHooks(trigger: "manual" | "auto"): Promise<ToolResult> {
+    return runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "PreCompact",
+      sessionId: this.id,
+      trigger,
+      matcherTarget: trigger,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+  }
+
+  private async runNotificationHooks(type: string, title: string, message: string): Promise<void> {
+    const result = await runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "Notification",
+      sessionId: this.id,
+      matcherTarget: type,
+      notification: { type, title, message },
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+    if (!result.ok) {
+      await this.emit({ type: "error", category: result.errorType === "permission_blocked" ? "permission" : "runtime", error: result.output });
+    }
+  }
+
+  private async runPreToolUseHooks(tool: ToolDefinition, input: Record<string, unknown>): Promise<ToolResult> {
+    return runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "PreToolUse",
+      tool: tool.name,
+      input,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+  }
+
+  private async runToolWithPostHooks(tool: ToolDefinition, input: Record<string, unknown>): Promise<ToolResult> {
+    const result = await tool.run(input);
+    if (!result.ok) return result;
+
+    const post = await runHookEvent(this.hooks, {
+      cwd: this.config.cwd,
+      event: "PostToolUse",
+      tool: tool.name,
+      input,
+      result,
+      maxOutputChars: this.config.maxToolOutputChars,
+      allowDangerousCommands: this.config.allowDangerousCommands
+    });
+    if (post.ok || post.output.trim() === "") {
+      return post.metadata ? { ...result, metadata: { ...result.metadata, ...post.metadata } } : result;
+    }
+    return {
+      ...result,
+      output: `${result.output}\n\n[hook warning]\n${post.output}`,
+      metadata: { ...result.metadata, hookWarning: true, ...post.metadata }
+    };
+  }
+
   async forceCompact(): Promise<void> {
+    const pre = await this.runPreCompactHooks("manual");
+    if (!pre.ok) {
+      await this.emit({ type: "error", category: pre.errorType === "permission_blocked" ? "permission" : "runtime", error: pre.output });
+      return;
+    }
     const compacted = await maybeCompactMessages(this.config, this.messages, this.summary);
     this.messages = compacted.messages;
     this.summary = compacted.summary;
@@ -533,7 +715,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       }
     }
 
-    throw new Error("Could not generate CLAUDE.md — model did not produce a final answer.");
+    throw new Error("Could not generate CLAUDE.md - model did not produce a final answer.");
   }
 
   getSummary(): string {
@@ -548,8 +730,124 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
     return { ...this.record, messages: [...this.messages], events: [...this.events], tasks: [...(this.record.tasks ?? [])], plans: [...(this.record.plans ?? [])], capabilities: [...this.capabilities], summary: this.summary };
   }
 
+  describeSession(): string {
+    return [
+      `session: ${this.id}`,
+      `title: ${this.record.title ?? "Untitled session"}`,
+      `createdAt: ${this.record.createdAt}`,
+      `updatedAt: ${this.record.updatedAt}`,
+      `cwd: ${this.record.cwd}`,
+      `messages: ${this.messages.length}`
+    ].join("\n");
+  }
+
+  describeTodos(): string {
+    const task = this.record.tasks?.at(-1);
+    if (!task) return "todos: none";
+    if (task.todos.length === 0) return [`todos: none`, `latest task: ${task.status} - ${task.userRequest}`].join("\n");
+    const rows = task.todos.map((todo) => ({
+      status: todo.status,
+      id: todo.id,
+      content: todo.content
+    }));
+    return [
+      `todos: ${task.status} - ${task.userRequest}`,
+      renderTable(rows, [
+        { key: "status", width: 14, value: (item) => item.status },
+        { key: "id", width: 6, value: (item) => item.id },
+        { key: "content", width: 90, value: (item) => item.content }
+      ])
+    ].join("\n");
+  }
+
+  describeTasks(): string {
+    const tasks = this.record.tasks ?? [];
+    if (tasks.length === 0) return "tasks: none";
+    const rows = tasks.slice(-12).map((task) => ({
+      id: task.id,
+      status: task.status,
+      todos: `${task.todos.filter((todo) => todo.status === "completed").length}/${task.todos.length}`,
+      tools: String(task.toolCalls.length),
+      request: task.userRequest
+    }));
+    return [
+      `tasks: showing ${rows.length} of ${tasks.length}`,
+      renderTable(rows, [
+        { key: "status", width: 14, value: (item) => item.status },
+        { key: "todos", width: 8, value: (item) => item.todos },
+        { key: "tools", width: 7, value: (item) => item.tools },
+        { key: "request", width: 90, value: (item) => item.request }
+      ])
+    ].join("\n");
+  }
+
+  async renameSession(title: string): Promise<string> {
+    const trimmed = title.replace(/\s+/g, " ").trim();
+    if (!trimmed) throw new Error("Session title cannot be empty.");
+    this.record = { ...this.record, title: trimmed };
+    await this.persist();
+    return `renamed session: ${trimmed}`;
+  }
+
   describeTools(): string {
     return this.toolDescriptions;
+  }
+
+  async describeMemory(): Promise<string> {
+    const memory = await loadProjectMemory(this.config.cwd);
+    return memory || "No CLAUDE.md files found.";
+  }
+
+  async describeMemorySources(): Promise<string> {
+    return renderMemorySources(await loadProjectMemorySources(this.config.cwd));
+  }
+
+  async addMemory(scopeValue: string, note: string): Promise<string> {
+    const scope = parseMemoryScope(scopeValue.trim());
+    const written = await appendProjectMemory(this.config.cwd, scope, note);
+    await this.refreshSystemPromptForSkills();
+    await this.persist();
+    return `Added ${scope} memory: ${written}`;
+  }
+
+  async reloadMemory(): Promise<string> {
+    await this.refreshSystemPromptForSkills();
+    await this.persist();
+    const sources = await loadProjectMemorySources(this.config.cwd);
+    const loaded = sources.filter((source) => source.exists && source.bytes > 0).length;
+    return `Reloaded memory: ${loaded} source${loaded === 1 ? "" : "s"}`;
+  }
+
+  async describeOutputStyles(): Promise<string> {
+    return renderOutputStyleList(await discoverOutputStyles(this.config.cwd, this.outputStyle.name, this.config.includeGlobalSkills !== false));
+  }
+
+  describeOutputStyle(): string {
+    return [
+      `output style: ${this.outputStyle.name}`,
+      `source: ${this.outputStyle.source}`,
+      `description: ${this.outputStyle.description}`,
+      this.outputStyle.path ? `path: ${this.outputStyle.path}` : undefined,
+      "",
+      this.outputStyle.content
+    ].filter((line): line is string => line !== undefined).join("\n");
+  }
+
+  async setOutputStyle(name: string): Promise<string> {
+    this.outputStyle = await resolveOutputStyle(this.config.cwd, name, this.config.includeGlobalSkills !== false);
+    await setProjectConfigValue(this.config.cwd, "outputStyle", this.outputStyle.name);
+    await this.refreshSystemPromptForSkills();
+    await this.persist();
+    return `Set output style: ${this.outputStyle.name}`;
+  }
+
+  async createOutputStyle(name: string, instructions: string): Promise<string> {
+    const created = await createProjectOutputStyle(this.config.cwd, name, instructions);
+    this.outputStyle = { ...created, active: true };
+    await setProjectConfigValue(this.config.cwd, "outputStyle", created.name);
+    await this.refreshSystemPromptForSkills();
+    await this.persist();
+    return [`Created output style ${created.name}`, `path: ${created.path}`, `Set output style: ${created.name}`].join("\n");
   }
 
   describeCapabilities(): string {
@@ -585,6 +883,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       { field: "provider", value: this.config.provider },
       { field: "model", value: this.config.model },
       { field: "planModel", value: this.config.planModel },
+      { field: "outputStyle", value: this.outputStyle.name },
       { field: "permissionMode", value: this.permissionMode },
       { field: "messages", value: String(this.messages.length) },
       { field: "summary", value: this.summary ? "yes" : "no" },
@@ -614,6 +913,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
         { field: "provider", value: this.config.provider, source: this.config.configSources?.provider ?? "default" },
         { field: "model", value: this.config.model, source: this.config.configSources?.model ?? "default" },
         { field: "planModel", value: this.config.planModel, source: this.config.configSources?.planModel ?? "default" },
+        { field: "outputStyle", value: this.outputStyle.name, source: this.config.configSources?.outputStyle ?? "default" },
         { field: "baseUrl", value: this.config.baseUrl, source: "config" },
         { field: "toolProtocol", value: this.config.toolProtocol ?? "json", source: "config" }
       ], [
@@ -634,6 +934,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       { field: "provider", value: this.config.provider, source: this.config.configSources?.provider ?? "default" },
       { field: "model", value: this.config.model, source: this.config.configSources?.model ?? "default" },
       { field: "planModel", value: this.config.planModel, source: this.config.configSources?.planModel ?? "default" },
+      { field: "outputStyle", value: this.outputStyle.name, source: this.config.configSources?.outputStyle ?? "default" },
       { field: "permissionMode", value: this.permissionMode, source: this.config.configSources?.permissionMode ?? "default" },
       { field: "toolsPolicy", value: this.config.toolsPolicy, source: this.config.configSources?.toolsPolicy ?? "default" },
       { field: "toolProtocol", value: this.config.toolProtocol ?? "json", source: "config" },
@@ -648,7 +949,39 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       { key: "field", width: 22, value: (item) => item.field },
       { key: "value", width: 88, value: (item) => item.value },
       { key: "source", width: 12, value: (item) => item.source }
-    ])].join("\n");
+    ]), "", "Use /config get <key>, /config set <key> <value>, or /config unset <key>. Most changes apply to new sessions."].join("\n");
+  }
+
+  describeProjectConfig(): string {
+    return [
+      "project config:",
+      renderProjectConfig(this.config.cwd),
+      "",
+      `supported keys: ${configurableKeys().join(", ")}`
+    ].join("\n");
+  }
+
+  getProjectConfig(key: string): string {
+    const value = getProjectConfigValue(this.config.cwd, key);
+    return value === undefined ? `${key} is not set in project config.` : `${key}=${formatConfigValue(value)}`;
+  }
+
+  async setProjectConfig(key: string, value: string): Promise<string> {
+    const result = await setProjectConfigValue(this.config.cwd, key, value);
+    return [
+      `Set ${result.key}=${formatConfigValue(result.value)}`,
+      `path: ${result.path}`,
+      "Restart or run /new for startup config changes to take effect."
+    ].join("\n");
+  }
+
+  async unsetProjectConfig(key: string): Promise<string> {
+    const result = await unsetProjectConfigValue(this.config.cwd, key);
+    return [
+      result.existed ? `Unset ${result.key}` : `${result.key} was not set`,
+      `path: ${result.path}`,
+      "Restart or run /new for startup config changes to take effect."
+    ].join("\n");
   }
 
   describeFeatures(): string {
@@ -659,6 +992,82 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       "",
       "Enable experimental flags with FEATURE_<NAME>=1, for example FEATURE_BUDDY=1."
     ].filter((line, index) => flags.length > 0 || index !== 1).join("\n");
+  }
+
+  describeCost(): string {
+    const messages = this.messages;
+    const events = this.events;
+    const tasks = this.record.tasks ?? [];
+    const inputChars = messages.filter((message) => message.role === "system" || message.role === "user" || message.role === "tool").reduce((sum, message) => sum + message.content.length, 0);
+    const assistantChars = messages.filter((message) => message.role === "assistant").reduce((sum, message) => sum + message.content.length, 0);
+    const streamChars = events.filter((event): event is Extract<AgentEvent, { type: "model_stream_delta" }> => event.type === "model_stream_delta").reduce((sum, event) => sum + event.text.length, 0);
+    const modelResponses = events.filter((event) => event.type === "model_response").length;
+    const toolCalls = tasks.reduce((sum, task) => sum + task.toolCalls.length, 0);
+    const toolOutputChars = tasks.flatMap((task) => task.toolCalls).reduce((sum, call) => sum + (call.output?.length ?? 0), 0);
+    const totalInputTokens = estimateTokens(inputChars + toolOutputChars);
+    const totalOutputTokens = estimateTokens(assistantChars + streamChars);
+    const totalTokens = totalInputTokens + totalOutputTokens;
+    const rows = [
+      { field: "model", value: this.config.model },
+      { field: "provider", value: this.config.provider },
+      { field: "modelResponses", value: String(modelResponses) },
+      { field: "messages", value: String(messages.length) },
+      { field: "toolCalls", value: String(toolCalls) },
+      { field: "inputTokens", value: `~${totalInputTokens}` },
+      { field: "outputTokens", value: `~${totalOutputTokens}` },
+      { field: "totalTokens", value: `~${totalTokens}` },
+      { field: "note", value: "Local estimate only; provider billing may differ." }
+    ];
+    return ["cost:", renderTable(rows, [
+      { key: "field", width: 18, value: (item) => item.field },
+      { key: "value", width: 90, value: (item) => item.value }
+    ])].join("\n");
+  }
+
+  describeReleaseNotes(): string {
+    return renderReleaseNotes();
+  }
+
+  describeBugReport(description = ""): string {
+    const task = this.record.tasks?.at(-1);
+    const lastError = [...this.events].reverse().find((event): event is Extract<AgentEvent, { type: "error" }> => event.type === "error");
+    const toolCalls = this.record.tasks?.flatMap((item) => item.toolCalls) ?? [];
+    const failedTools = toolCalls.filter((call) => call.ok === false || call.status === "failed" || call.status === "blocked" || call.status === "denied" || call.status === "validation_error");
+    const body = description.trim() || "[describe what happened]";
+    return [
+      "# Mini Code Bug Report",
+      "",
+      "## Problem",
+      body,
+      "",
+      "## Session",
+      `- session: ${this.id}`,
+      `- cwd: ${this.config.cwd}`,
+      `- provider: ${this.config.provider}`,
+      `- model: ${this.config.model}`,
+      `- planModel: ${this.config.planModel}`,
+      `- permissionMode: ${this.permissionMode}`,
+      `- toolProtocol: ${this.config.toolProtocol ?? "json"}`,
+      `- featureFlags: ${this.config.featureFlags?.join(", ") || "none"}`,
+      "",
+      "## Recent State",
+      `- messages: ${this.messages.length}`,
+      `- summary: ${this.summary ? "yes" : "no"}`,
+      `- latestTask: ${task ? task.status : "none"}`,
+      `- latestRequest: ${task?.userRequest ?? this.record.lastUserMessage ?? "none"}`,
+      `- toolCalls: ${toolCalls.length}`,
+      `- failedToolCalls: ${failedTools.length}`,
+      `- lastError: ${lastError?.error ?? task?.error ?? "none"}`,
+      "",
+      "## Diagnostics",
+      "```",
+      this.describeDoctor(),
+      "```",
+      "",
+      "## Notes",
+      "- Remove secrets, tokens, private paths, and proprietary code before sharing.",
+      "- Include the exact command or prompt that triggered the issue if safe to share."
+    ].join("\n");
   }
 
   describeLogin(): string {
@@ -772,13 +1181,68 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       { scope: "shell", decision: this.permissionMode === "bypass_permissions" ? "allowed" : "ask", detail: "Dangerous commands are blocked unless --allow-dangerous is set." },
       { scope: "mode", decision: this.permissionMode, detail: this.permissionMode === "bypass_permissions" ? "Non-dangerous shell may run without prompting." : "Permission mode controls default approval behavior." },
       { scope: "remembered approvals", decision: String(remembered.length), detail: remembered.join(", ") || "none" },
-      { scope: "remembered prefixes", decision: String(prefixes.length), detail: prefixes.join(", ") || "none" }
+      { scope: "remembered prefixes", decision: String(prefixes.length), detail: prefixes.join(", ") || "none" },
+      { scope: "settings rules", decision: String(this.settings.permissions.length), detail: this.settings.permissions.map((rule) => `${rule.action}:${rule.matcher}`).join(", ") || "none" }
     ];
     return ["permissions:", renderTable(rows, [
       { key: "scope", width: 22, value: (item) => item.scope },
       { key: "decision", width: 18, value: (item) => item.decision },
       { key: "detail", width: 90, value: (item) => item.detail }
     ])].join("\n");
+  }
+
+  async addPermissionRule(action: "allow" | "deny", matcher: string): Promise<string> {
+    const result = await addSettingsPermissionRule(this.config.cwd, action, matcher);
+    this.settings = await loadProjectSettings(this.config.cwd, this.config.includeGlobalSkills !== false);
+    await this.persist();
+    return [
+      `${result.added ? "Added" : "Already present"} permission rule: ${result.action}:${result.matcher}`,
+      `path: ${result.path}`,
+      `settings rules: ${this.settings.permissions.length}`
+    ].join("\n");
+  }
+
+  async removePermissionRule(action: "allow" | "deny", matcher: string): Promise<string> {
+    const result = await removeSettingsPermissionRule(this.config.cwd, action, matcher);
+    this.settings = await loadProjectSettings(this.config.cwd, this.config.includeGlobalSkills !== false);
+    await this.persist();
+    return [
+      `${result.removed ? "Removed" : "Rule not found"} permission rule: ${result.action}:${result.matcher}`,
+      `path: ${result.path}`,
+      `settings rules: ${this.settings.permissions.length}`
+    ].join("\n");
+  }
+
+  async reloadPermissions(): Promise<string> {
+    const before = this.settings.permissions.length;
+    this.settings = await loadProjectSettings(this.config.cwd, this.config.includeGlobalSkills !== false);
+    await this.persist();
+    return `Reloaded permissions: before=${before} after=${this.settings.permissions.length}`;
+  }
+
+  describeHooks(): string {
+    const rows = hookRows(this.hooks);
+    if (rows.length === 0) return "hooks: none";
+    return ["hooks:", renderTable(rows, [
+      { key: "event", width: 14, value: (item) => item.event },
+      { key: "matcher", width: 18, value: (item) => item.matcher },
+      { key: "command", width: 44, value: (item) => item.command },
+      { key: "timeout", width: 10, value: (item) => `${item.timeoutMs}ms` },
+      { key: "source", width: 54, value: (item) => item.source }
+    ])].join("\n");
+  }
+
+  async reloadHooks(): Promise<string> {
+    const before = hookRows(this.hooks);
+    this.hooks = await loadHookConfig(this.config.cwd, this.config.includeGlobalSkills !== false);
+    this.settings = await loadProjectSettings(this.config.cwd, this.config.includeGlobalSkills !== false);
+    const after = hookRows(this.hooks);
+    await this.persist();
+    return [
+      `Reloaded hooks: before=${before.length} after=${after.length}`,
+      `PreToolUse=${this.hooks.PreToolUse.reduce((sum, rule) => sum + rule.hooks.length, 0)}`,
+      `PostToolUse=${this.hooks.PostToolUse.reduce((sum, rule) => sum + rule.hooks.length, 0)}`
+    ].join("\n");
   }
 
   describeSkills(): string {
@@ -821,6 +1285,149 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
     ].join("\n");
   }
 
+  async reloadCustomCommands(): Promise<string> {
+    const before = this.customCommands;
+    const after = await discoverCustomCommands(this.config.cwd, this.config.includeGlobalSkills !== false);
+    this.customCommands = after;
+    const beforeNames = new Set(before.map((command) => command.name));
+    const afterNames = new Set(after.map((command) => command.name));
+    const added = after.filter((command) => !beforeNames.has(command.name)).map((command) => command.name);
+    const removed = before.filter((command) => !afterNames.has(command.name)).map((command) => command.name);
+    await this.persist();
+    return [
+      `Reloaded custom commands: before=${before.length} after=${after.length}`,
+      added.length ? `added: ${added.join(", ")}` : "added: none",
+      removed.length ? `removed: ${removed.join(", ")}` : "removed: none"
+    ].join("\n");
+  }
+
+  describeCustomCommands(): string {
+    return renderCustomCommandList(this.customCommands);
+  }
+
+  getCustomCommands(): CustomCommandInfo[] {
+    return [...this.customCommands];
+  }
+
+  async runCustomCommand(name: string, args: string): Promise<string> {
+    const command = resolveCustomCommand(this.customCommands, name);
+    if (!command) throw new Error(`Custom command not found: /${name}`);
+    return this.run(renderCustomCommandPrompt(command, args));
+  }
+
+  async reloadSubagents(): Promise<string> {
+    const before = this.subagents;
+    const after = await discoverSubagents(this.config.cwd, this.config.includeGlobalSkills !== false);
+    this.subagents = after;
+    const beforeNames = new Set(before.map((agent) => agent.name));
+    const afterNames = new Set(after.map((agent) => agent.name));
+    const added = after.filter((agent) => !beforeNames.has(agent.name)).map((agent) => agent.name);
+    const removed = before.filter((agent) => !afterNames.has(agent.name)).map((agent) => agent.name);
+    await this.persist();
+    return [
+      `Reloaded subagents: before=${before.length} after=${after.length}`,
+      added.length ? `added: ${added.join(", ")}` : "added: none",
+      removed.length ? `removed: ${removed.join(", ")}` : "removed: none"
+    ].join("\n");
+  }
+
+  private async refreshSubagents(): Promise<void> {
+    this.subagents = await discoverSubagents(this.config.cwd, this.config.includeGlobalSkills !== false);
+    await this.persist();
+  }
+
+  describeSubagents(): string {
+    return renderSubagentList(this.subagents);
+  }
+
+  inspectSubagent(nameOrId: string): string {
+    const resolved = resolveSubagent(this.subagents, nameOrId);
+    if (!resolved.agent) return `Subagent not found: ${nameOrId}`;
+    return renderSubagentInspect(resolved.agent, resolved.candidates);
+  }
+
+  getSubagents(): SubagentInfo[] {
+    return [...this.subagents];
+  }
+
+  async useSubagent(nameOrId: string, task: string): Promise<string> {
+    const resolved = resolveSubagent(this.subagents, nameOrId);
+    if (!resolved.agent) throw new Error(`Subagent not found: ${nameOrId}`);
+    const previous = this.activeSubagentName;
+    const previousTools = this.activeSubagentToolNames;
+    const previousPrompt = this.activeSubagentSystemPrompt;
+    this.activeSubagentName = resolved.agent.name;
+    this.activeSubagentToolNames = subagentToolNames(resolved.agent, Array.from(this.tools.values()));
+    this.activeSubagentSystemPrompt = this.scopedSubagentSystemPrompt(resolved.agent, this.activeSubagentToolNames);
+    try {
+      return await this.run(subagentInjection(resolved.agent, task));
+    } finally {
+      this.activeSubagentName = previous;
+      this.activeSubagentToolNames = previousTools;
+      this.activeSubagentSystemPrompt = previousPrompt;
+    }
+  }
+
+  private scopedSubagentSystemPrompt(agent: SubagentInfo, allowedNames: Set<string> | undefined): Message | undefined {
+    if (!allowedNames) return undefined;
+    const scopedTools = Array.from(this.tools.values()).filter((tool) => allowedNames.has(tool.name));
+    const allowed = Array.from(allowedNames).sort();
+    const fallbackTool = allowed[0] ?? "";
+    const exampleTool = allowed.includes("read_file") ? `{"action":"tool","tool":"read_file","input":{"path":"README.md"},"thought":"inspect the requested file"}` : fallbackTool ? `{"action":"tool","tool":"${fallbackTool}","input":{},"thought":"use an allowed tool"}` : "";
+    return {
+      role: "system",
+      content: [
+        [
+          "You are Mini Code Agent, a local coding assistant running a foreground subagent in the user's workspace.",
+          "",
+          "Use only the available tools listed below. If a tool is not listed, do not call it.",
+          "",
+          `Available tools:\n${renderScopedTools(scopedTools)}`,
+          "",
+          "Decision format:",
+          exampleTool,
+          `{"action":"final","answer":"short summary for the user"}`
+        ].filter(Boolean).join("\n"),
+        `Foreground subagent ${agent.name} declared tools: ${agent.tools.join(", ")}.`,
+        `Only these internal tools are allowed for this foreground subagent: ${Array.from(allowedNames).sort().join(", ") || "[none]"}.`
+      ].join("\n\n")
+    };
+  }
+
+  async createSubagent(rawName: string, rawDescription = ""): Promise<string> {
+    const created = await createProjectSubagent(this.config.cwd, rawName, rawDescription);
+    const reloadSummary = await this.reloadSubagents();
+    this.messages.push({
+      role: "user",
+      content: [
+        `Project subagent created: ${created.name}`,
+        `Path: ${created.path}`,
+        `Description: ${created.description}`,
+        "Use /agent:<name> <task> to run it, or edit the Markdown file to specialize the persona."
+      ].join("\n")
+    });
+    await this.persist();
+    return [
+      `Created subagent ${created.name}`,
+      `path: ${created.path}`,
+      `description: ${created.description}`,
+      reloadSummary
+    ].join("\n");
+  }
+
+  async runReview(target = ""): Promise<string> {
+    const scope = target.trim() || "the current workspace changes";
+    return this.run([
+      `Review ${scope}.`,
+      "",
+      "Act as a code reviewer. Inspect relevant files and diffs before answering.",
+      "Do not edit files or run mutating commands.",
+      "Prioritize findings by severity with concrete file/line references when available.",
+      "Focus on bugs, regressions, missing tests, security risks, and behavior changes.",
+      "Keep any summary brief and place it after findings."
+    ].join("\n"));
+  }
+
   private async refreshSkillContext(): Promise<void> {
     this.skills = await discoverSkills(this.config.cwd, this.config.skills, this.config.enableSkills, { includeGlobal: this.config.includeGlobalSkills });
     await this.refreshSystemPromptForSkills();
@@ -829,7 +1436,7 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
 
   private async refreshSystemPromptForSkills(): Promise<void> {
     const projectMemory = await loadProjectMemory(this.config.cwd);
-    if (this.messages[0]?.role === "system") this.messages[0] = { role: "system", content: systemPrompt(Array.from(this.tools.values()), this.skills, projectMemory) };
+    if (this.messages[0]?.role === "system") this.messages[0] = { role: "system", content: systemPrompt(Array.from(this.tools.values()), this.skills, projectMemory, outputStylePrompt(this.outputStyle)) };
   }
 
   async createSkill(rawName: string, rawDescription = ""): Promise<string> {
@@ -886,7 +1493,9 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   private async nextDecision(options: { allowMarkdownFinal?: boolean } = {}): Promise<{ raw: string; decision: AgentDecision }> {
     let raw = await this.callModel();
     try {
-      return { raw, decision: parseDecision(raw, this.tools) };
+      const decision = parseDecision(raw, this.tools);
+      this.assertSubagentToolAllowed(decision);
+      return { raw, decision };
     } catch (error) {
       if (options.allowMarkdownFinal && isDisplayMarkdownFinal(raw)) {
         return { raw, decision: { action: "final", answer: raw.trim() } };
@@ -896,7 +1505,9 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
       await this.persist();
       raw = await this.callModel();
       try {
-        return { raw, decision: parseDecision(raw, this.tools) };
+        const decision = parseDecision(raw, this.tools);
+        this.assertSubagentToolAllowed(decision);
+        return { raw, decision };
       } catch (secondError) {
         if (options.allowMarkdownFinal && isDisplayMarkdownFinal(raw)) {
           return { raw, decision: { action: "final", answer: raw.trim() } };
@@ -911,12 +1522,13 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   private async callModel(): Promise<string> {
     let response;
     try {
+      const messages = this.activeSubagentSystemPrompt ? [this.activeSubagentSystemPrompt, ...this.messages.filter((message) => message.role !== "system")] : this.messages;
       response = await complete({
         provider: this.config.provider,
         baseUrl: this.config.baseUrl,
         apiKey: this.config.apiKey,
         model: this.config.model,
-        messages: this.messages,
+        messages,
         toolProtocol: this.config.toolProtocol,
         tools: Array.from(this.tools.values()),
         signal: this.abortController?.signal ?? undefined,
@@ -929,6 +1541,13 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
     this.messages.push({ role: "assistant", content: response.content });
     await this.emit({ type: "model_response", raw: response.raw, content: response.content, provider: response.provider, model: response.model, streamEvents: response.streamEvents });
     return response.content;
+  }
+
+  private assertSubagentToolAllowed(decision: AgentDecision): void {
+    if (decision.action !== "tool" || !this.activeSubagentToolNames) return;
+    const tool = decision.tool ?? "";
+    if (this.activeSubagentToolNames.has(tool)) return;
+    throw new Error(`Subagent ${this.activeSubagentName ?? ""} cannot use tool ${tool}. Declared tools: ${Array.from(this.activeSubagentToolNames).sort().join(", ") || "[none]"}`);
   }
 
   private rememberApproval(tool: string, input: Record<string, unknown>, key: string | undefined, decision: ApprovalDecision): void {
@@ -965,6 +1584,12 @@ Return only valid JSON: {"action":"final","answer":"<full CLAUDE.md content>"}`;
   }
 
   private async compactIfNeeded(): Promise<void> {
+    if (!shouldCompactMessages(this.config, this.messages)) return;
+    const pre = await this.runPreCompactHooks("auto");
+    if (!pre.ok) {
+      await this.emit({ type: "error", category: pre.errorType === "permission_blocked" ? "permission" : "runtime", error: pre.output });
+      return;
+    }
     const compacted = await maybeCompactMessages(this.config, this.messages, this.summary);
     if (!compacted.compacted) return;
     this.messages = compacted.messages;
@@ -1078,6 +1703,10 @@ function firstContentLine(answer: string): string {
   return answer.split(/\r?\n/).map((line) => line.replace(/^#{1,6}\s*/, "").trim()).find(Boolean) ?? "";
 }
 
+function estimateTokens(chars: number): number {
+  return Math.ceil(chars / 4);
+}
+
 function startNextTodo(task: TaskRecord): void {
   if (task.todos.some((todo) => todo.status === "in_progress")) return;
   const next = task.todos.find((todo) => todo.status === "pending");
@@ -1115,6 +1744,18 @@ function approvalMetadata(requirement: import("./types.js").ApprovalRequirement)
     blocked: requirement.blocked,
     rememberable: requirement.rememberable
   };
+}
+
+function renderScopedTools(tools: ToolDefinition[]): string {
+  if (tools.length === 0) return "[none]";
+  return tools
+    .map((tool) => {
+      const schema = Object.entries(tool.inputSchema)
+        .map(([key, value]) => `    ${key}: ${value}`)
+        .join("\n");
+      return `- ${tool.name} [risk=${tool.risk}]: ${tool.description}\n${schema || "    no input"}`;
+    })
+    .join("\n");
 }
 
 function looksJsonLike(value: string): boolean {

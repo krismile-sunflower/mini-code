@@ -23,6 +23,7 @@ export interface ConfigSources {
   agentDir: ConfigSource;
   sessionDir: ConfigSource;
   toolsPolicy: ConfigSource;
+  outputStyle: ConfigSource;
 }
 
 export interface SkillInfo {
@@ -56,6 +57,26 @@ export interface SkillHelper {
   risk: ToolRisk;
 }
 
+export interface CustomCommandInfo {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  source: "project" | "global";
+  content: string;
+}
+
+export interface SubagentInfo {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  source: "project" | "global";
+  tools: string[];
+  content: string;
+  shadowedBy?: string;
+}
+
 export interface AgentConfig {
   cwd: string;
   provider: LlmProvider;
@@ -77,6 +98,7 @@ export interface AgentConfig {
   enableMcp?: boolean;
   mcpConfigPath?: string;
   toolProtocol?: ToolProtocol;
+  outputStyle: string;
   featureFlags?: string[];
   maxContextMessages: number;
   maxToolOutputChars: number;

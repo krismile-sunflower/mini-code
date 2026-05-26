@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import { AgentSession } from "../core/agent.js";
 import { SessionStore } from "../storage/sessionStore.js";
-import type { AgentConfig, AgentEvent, ApprovalDecision, PendingApproval, PlanRecord, SkillInfo } from "../core/types.js";
+import type { AgentConfig, AgentEvent, ApprovalDecision, CustomCommandInfo, PendingApproval, PlanRecord, SkillInfo } from "../core/types.js";
 import {
   approvalCardRows,
   asciiArt,
@@ -68,6 +68,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
   const [aborting, setAborting] = useState(false);
   const [commandIndex, setCommandIndex] = useState(0);
   const [availableSkills, setAvailableSkills] = useState(skills);
+  const [customCommands, setCustomCommands] = useState<CustomCommandInfo[]>([]);
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
   const [skillSearch, setSkillSearch] = useState("");
   const [skillIndex, setSkillIndex] = useState(0);
@@ -137,6 +138,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
     setMessageCount(session.getMessageCount());
     setHasSummary(Boolean(session.getSummary()));
     setAvailableSkills(session.getSkills());
+    setCustomCommands(session.getCustomCommands());
     return session;
   };
 
@@ -156,6 +158,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
     setMessageCount(session.getMessageCount());
     setHasSummary(Boolean(session.getSummary()));
     setAvailableSkills(session.getSkills());
+    setCustomCommands(session.getCustomCommands());
     pushItems({ kind: "session", text: `${clearTimeline ? "New" : "Resumed"} session ${session.id}` });
     const capabilityChange = session.getCapabilityChangeSummary();
     if (capabilityChange) pushItems({ kind: "session", text: capabilityChange });
@@ -190,9 +193,14 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
       } else if (trimmed === "/" || trimmed === "/help") {
         pushItems({ kind: "session", text: renderCommandHelp() });
       } else if (trimmed === "/memory") {
-        const { loadProjectMemory } = await import("../core/memory.js");
-        const mem = await loadProjectMemory(activeConfig.cwd);
-        pushItems({ kind: "session", text: mem || "No CLAUDE.md files found." });
+        pushItems({ kind: "session", text: await session.describeMemory() });
+      } else if (trimmed === "/memory list") {
+        pushItems({ kind: "session", text: await session.describeMemorySources() });
+      } else if (trimmed === "/memory reload") {
+        pushItems({ kind: "session", text: await session.reloadMemory() });
+      } else if (trimmed.startsWith("/memory add ")) {
+        const { scope, note } = parseMemoryAddRequest(trimmed.slice("/memory add ".length));
+        pushItems({ kind: "session", text: await session.addMemory(scope, note) });
       } else if (trimmed === "/init") {
         pushItems({ kind: "session", text: "Analysing repository to generate CLAUDE.md..." });
         const outPath = await session.initProjectMemory();
@@ -203,14 +211,58 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
         pushItems({ kind: "session", text: session.describeModel() });
       } else if (trimmed === "/config") {
         pushItems({ kind: "session", text: session.describeConfig() });
+      } else if (trimmed === "/config list") {
+        pushItems({ kind: "session", text: session.describeProjectConfig() });
+      } else if (trimmed.startsWith("/config get ")) {
+        pushItems({ kind: "session", text: session.getProjectConfig(trimmed.slice("/config get ".length).trim()) });
+      } else if (trimmed.startsWith("/config set ")) {
+        const { key, value } = parseKeyValue(trimmed.slice("/config set ".length));
+        pushItems({ kind: "session", text: await session.setProjectConfig(key, value) });
+      } else if (trimmed.startsWith("/config unset ")) {
+        pushItems({ kind: "session", text: await session.unsetProjectConfig(trimmed.slice("/config unset ".length).trim()) });
       } else if (trimmed === "/doctor") {
         pushItems({ kind: "session", text: session.describeDoctor() });
       } else if (trimmed === "/features") {
         pushItems({ kind: "session", text: session.describeFeatures() });
+      } else if (trimmed === "/cost") {
+        pushItems({ kind: "session", text: session.describeCost() });
+      } else if (trimmed === "/release-notes") {
+        pushItems({ kind: "session", text: session.describeReleaseNotes() });
+      } else if (trimmed === "/output-style") {
+        pushItems({ kind: "session", text: session.describeOutputStyle() });
+      } else if (trimmed === "/output-style list") {
+        pushItems({ kind: "session", text: await session.describeOutputStyles() });
+      } else if (trimmed.startsWith("/output-style set ")) {
+        pushItems({ kind: "session", text: await session.setOutputStyle(trimmed.slice("/output-style set ".length).trim()) });
+      } else if (trimmed.startsWith("/output-style create ")) {
+        const { name, instructions } = parseOutputStyleCreateRequest(trimmed.slice("/output-style create ".length));
+        pushItems({ kind: "session", text: await session.createOutputStyle(name, instructions) });
+      } else if (trimmed === "/bug" || trimmed.startsWith("/bug ")) {
+        pushItems({ kind: "session", text: session.describeBugReport(trimmed.startsWith("/bug ") ? trimmed.slice("/bug ".length) : "") });
       } else if (trimmed === "/login") {
         pushItems({ kind: "session", text: session.describeLogin() });
       } else if (trimmed === "/tools") {
         pushItems({ kind: "session", text: session.describeTools() });
+      } else if (trimmed === "/commands") {
+        pushItems({ kind: "session", text: session.describeCustomCommands() });
+      } else if (trimmed === "/commands reload") {
+        const summary = await session.reloadCustomCommands();
+        setCustomCommands(session.getCustomCommands());
+        pushItems({ kind: "session", text: summary });
+      } else if (trimmed === "/agents") {
+        pushItems({ kind: "session", text: session.describeSubagents() });
+      } else if (trimmed === "/agents reload") {
+        pushItems({ kind: "session", text: await session.reloadSubagents() });
+      } else if (trimmed.startsWith("/agent inspect ")) {
+        pushItems({ kind: "session", text: session.inspectSubagent(trimmed.slice("/agent inspect ".length).trim()) });
+      } else if (trimmed.startsWith("/agent create ")) {
+        const { name, description } = parseSkillCreateRequest(trimmed.slice("/agent create ".length));
+        pushItems({ kind: "session", text: await session.createSubagent(name, description) });
+      } else if (trimmed.startsWith("/agent:")) {
+        const body = trimmed.slice("/agent:".length).trim();
+        const [name = "", ...rest] = body.split(/\s+/);
+        pushItems({ kind: "session", text: `Running subagent ${name}` });
+        await session.useSubagent(name, rest.join(" "));
       } else if (trimmed === "/capabilities") {
         pushItems({ kind: "session", text: session.describeCapabilities() });
       } else if (trimmed === "/mcp") {
@@ -225,6 +277,19 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
         pushItems({ kind: "session", text: session.reconnectMcp(trimmed.slice("/mcp reconnect ".length).trim()) });
       } else if (trimmed === "/permissions") {
         pushItems({ kind: "session", text: session.describePermissions() });
+      } else if (trimmed === "/permissions reload") {
+        pushItems({ kind: "session", text: await session.reloadPermissions() });
+      } else if (trimmed.startsWith("/permissions allow ")) {
+        pushItems({ kind: "session", text: await session.addPermissionRule("allow", trimmed.slice("/permissions allow ".length)) });
+      } else if (trimmed.startsWith("/permissions deny ")) {
+        pushItems({ kind: "session", text: await session.addPermissionRule("deny", trimmed.slice("/permissions deny ".length)) });
+      } else if (trimmed.startsWith("/permissions remove ")) {
+        const { action, matcher } = parsePermissionRemoveRequest(trimmed.slice("/permissions remove ".length));
+        pushItems({ kind: "session", text: await session.removePermissionRule(action, matcher) });
+      } else if (trimmed === "/hooks") {
+        pushItems({ kind: "session", text: session.describeHooks() });
+      } else if (trimmed === "/hooks reload") {
+        pushItems({ kind: "session", text: await session.reloadHooks() });
       } else if (trimmed === "/skills") {
         setAvailableSkills(session.getSkills());
         setSkillSearch("");
@@ -259,20 +324,43 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
         setHasSummary(Boolean(session.getSummary()));
       } else if (trimmed === "/summary") {
         pushItems({ kind: "compact", text: session.getSummary() || "[no summary]" });
+      } else if (trimmed === "/todos") {
+        pushItems({ kind: "session", text: session.describeTodos() });
+      } else if (trimmed === "/tasks") {
+        pushItems({ kind: "session", text: session.describeTasks() });
       } else if (trimmed === "/sessions") {
         const sessions = await new SessionStore(activeConfig.sessionDir).list();
         pushItems({
           kind: "session",
           text: sessions.map((item) => `${item.id} ${item.updatedAt} ${item.model} ${item.title} ${item.summary.slice(0, 80)}`).join("\n") || "No sessions"
         });
+      } else if (trimmed === "/continue") {
+        const latest = await new SessionStore(activeConfig.sessionDir).latest();
+        if (!latest) pushItems({ kind: "session", text: "No previous sessions found." });
+        else await switchSession({ ...activeConfig, sessionId: latest.id }, false);
+      } else if (trimmed === "/session") {
+        pushItems({ kind: "session", text: session.describeSession() });
+      } else if (trimmed.startsWith("/name ")) {
+        pushItems({ kind: "session", text: await session.renameSession(trimmed.slice("/name ".length)) });
       } else if (trimmed.startsWith("/rename ")) {
         const title = trimmed.slice("/rename ".length).trim();
-        const renamed = await new SessionStore(activeConfig.sessionDir).rename(session.id, title);
-        pushItems({ kind: "session", text: `Renamed session ${renamed.id}: ${renamed.title ?? "Untitled session"}` });
+        pushItems({ kind: "session", text: await session.renameSession(title) });
       } else if (trimmed.startsWith("/export-session ")) {
         const exportPath = trimmed.slice("/export-session ".length).trim();
         const written = await new SessionStore(activeConfig.sessionDir).export(session.id, exportPath);
         pushItems({ kind: "session", text: `Exported session to ${written}` });
+      } else if (trimmed.startsWith("/import-session ")) {
+        const importPath = trimmed.slice("/import-session ".length).trim();
+        const imported = await new SessionStore(activeConfig.sessionDir).import(importPath);
+        pushItems({ kind: "session", text: `Imported session ${imported.id}` });
+      } else if (trimmed.startsWith("/delete-session ")) {
+        const id = trimmed.slice("/delete-session ".length).trim();
+        if (id === session.id) {
+          pushItems({ kind: "session", text: "Cannot delete the active session. Start /new or resume another session first." });
+        } else {
+          const deleted = await new SessionStore(activeConfig.sessionDir).delete(id);
+          pushItems({ kind: "session", text: deleted ? `Deleted session ${id}` : `Session not found: ${id}` });
+        }
       } else if (trimmed === "/expand") {
         setExpanded((value) => !value);
         pushItems({ kind: "session", text: `Output ${expanded ? "collapsed" : "expanded"}` });
@@ -291,11 +379,35 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
         const id = trimmed.slice("/execute ".length).trim();
         pushItems({ kind: "session", text: `Executing plan ${id}` });
         await session.executePlan(id);
+      } else if (trimmed === "/review" || trimmed.startsWith("/review ")) {
+        pushItems({ kind: "session", text: `Reviewing ${trimmed.startsWith("/review ") ? truncateEnd(trimmed.slice("/review ".length).trim(), 90) : "current workspace changes"}` });
+        await session.runReview(trimmed.startsWith("/review ") ? trimmed.slice("/review ".length) : "");
       } else if (trimmed === "/new") {
         await switchSession({ ...activeConfig, sessionId: undefined }, true);
+      } else if (trimmed === "/resume") {
+        const sessions = await new SessionStore(activeConfig.sessionDir).list();
+        pushItems({
+          kind: "session",
+          text: sessions.map((item) => `${item.id} ${item.updatedAt} ${item.model} ${item.title} ${item.summary.slice(0, 80)}`).join("\n") || "No sessions"
+        });
       } else if (trimmed.startsWith("/resume ")) {
         const id = trimmed.slice("/resume ".length).trim();
         await switchSession({ ...activeConfig, sessionId: id }, false);
+      } else if (trimmed.startsWith("/fork ")) {
+        const id = trimmed.slice("/fork ".length).trim();
+        const forked = await new SessionStore(activeConfig.sessionDir).fork(id);
+        await switchSession({ ...activeConfig, sessionId: forked.id }, false);
+        pushItems({ kind: "session", text: `Forked session ${id} -> ${forked.id}` });
+      } else if (trimmed.startsWith("/") && !trimmed.startsWith("/skill:") && !trimmed.startsWith("/agent:")) {
+        const [nameWithSlash = "", ...rest] = trimmed.split(/\s+/);
+        const name = nameWithSlash.slice(1);
+        const match = customCommands.find((command) => command.name === name || command.name.startsWith(name));
+        if (!match) {
+          pushItems({ kind: "error", category: "runtime", text: `Unknown command: ${trimmed}` });
+        } else {
+          pushItems({ kind: "session", text: `Running custom command /${match.name}` });
+          await session.runCustomCommand(match.name, rest.join(" "));
+        }
       } else {
         pushItems({ kind: "user", text: trimmed });
         await session.run(trimmed);
@@ -314,7 +426,7 @@ export function App({ config, warnings = [], skills = [] }: { config: AgentConfi
     }
   };
 
-  const commandEntries = useMemo(() => input.startsWith("/") ? filterCommandsAndSkills(input, availableSkills) : [], [input, availableSkills]);
+  const commandEntries = useMemo(() => input.startsWith("/") ? filterCommandsAndSkills(input, availableSkills, customCommands) : [], [input, availableSkills, customCommands]);
   const selectedCommandIndex = commandEntries.length > 0 ? Math.min(commandIndex, commandEntries.length - 1) : 0;
   const skillRows = useMemo(() => skillPickerRows(availableSkills, skillSearch), [availableSkills, skillSearch]);
   const selectedSkillIndex = skillRows.length > 0 ? Math.min(skillIndex, skillRows.length - 1) : 0;
@@ -471,6 +583,31 @@ function parseSkillCreateRequest(value: string): { name: string; description: st
   const trimmed = value.trim();
   const [name = "", ...rest] = trimmed.split(/\s+/);
   return { name, description: rest.join(" ") };
+}
+
+function parseKeyValue(value: string): { key: string; value: string } {
+  const trimmed = value.trim();
+  const match = /^(\S+)\s+([\s\S]+)$/.exec(trimmed);
+  if (!match) throw new Error("Usage: /config set <key> <value>");
+  return { key: match[1], value: match[2] };
+}
+
+function parseMemoryAddRequest(value: string): { scope: string; note: string } {
+  const match = /^(\S+)\s+([\s\S]+)$/.exec(value.trim());
+  if (!match) throw new Error("Usage: /memory add <project|local|user> <note>");
+  return { scope: match[1], note: match[2] };
+}
+
+function parseOutputStyleCreateRequest(value: string): { name: string; instructions: string } {
+  const match = /^(\S+)\s+([\s\S]+)$/.exec(value.trim());
+  if (!match) throw new Error("Usage: /output-style create <name> <instructions>");
+  return { name: match[1], instructions: match[2] };
+}
+
+function parsePermissionRemoveRequest(value: string): { action: "allow" | "deny"; matcher: string } {
+  const match = /^(allow|deny)\s+([\s\S]+)$/.exec(value.trim());
+  if (!match) throw new Error("Usage: /permissions remove <allow|deny> <matcher>");
+  return { action: match[1] as "allow" | "deny", matcher: match[2] };
 }
 
 function SkillPickerPanel({ rows, selectedIndex, query, total }: { rows: SkillPickerRow[]; selectedIndex: number; query: string; total: number }) {
